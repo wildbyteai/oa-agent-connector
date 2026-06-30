@@ -201,9 +201,11 @@ class OAClient:
         try:
             response = self._request(endpoint, method="POST", data=payload)
         except OAConnectorError as exc:
-            if "HTTP 401" in str(exc) or "Unauthorized" in str(exc):
+            if self._should_fallback_to_ui_form(exc):
                 return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
             raise
+        except TimeoutError:
+            return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
         text = response["text"].strip()
         if text == fd_id:
             self._save_cookies()
@@ -212,6 +214,16 @@ class OAClient:
         if "Unauthorized" in text or "HTTP 401" in text:
             return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
         raise OAConnectorError(f"审批接口返回异常: {text[:500]}")
+
+    def _should_fallback_to_ui_form(self, exc: OAConnectorError) -> bool:
+        message = str(exc)
+        lowered = message.lower()
+        return (
+            "HTTP 401" in message
+            or "Unauthorized" in message
+            or "timeout" in lowered
+            or "timed out" in lowered
+        )
 
     def _approval_action_via_ui(
         self,
@@ -230,7 +242,7 @@ class OAClient:
         form_data = self._parse_form_fields(edit["text"])
         process_id = form_data.get("sysWfBusinessForm.fdProcessId") or fd_id
         audit_note_id = form_data.get("sysWfBusinessForm.fdAuditNoteFdId") or ""
-        task = self._find_review_workitem(form_data.get("sysWfBusinessForm.fdCurNodeXML", ""))
+        task = self._find_review_workitem(form_data.get("sysWfBusinessForm.fdCurNodeXML", ""), operation_type)
         param: Dict[str, Any] = {
             "operationName": "驳回" if operation_type == "handler_refuse" else "通过",
             "notifyType": "{}",
@@ -296,14 +308,56 @@ class OAClient:
             data.setdefault(key, unescape(value))
         return data
 
-    def _find_review_workitem(self, current_node_xml: str) -> Dict[str, str]:
-        root = ET.fromstring(current_node_xml)
+    def _find_review_workitem(self, current_node_xml: str, required_operation: Optional[str] = None) -> Dict[str, str]:
+        regex_task = self._find_review_workitem_by_regex(current_node_xml, required_operation)
+        if regex_task:
+            return regex_task
+
+        try:
+            root = ET.fromstring(current_node_xml)
+        except ET.ParseError as exc:
+            raise OAConnectorError("未找到当前登录账号可处理的流程 workitem") from exc
         for task in root.findall(".//task"):
             task_type = task.attrib.get("type", "")
             operations = {op.attrib.get("id") for op in task.findall(".//operation")}
-            if task_type == "reviewWorkitem" and ("handler_pass" in operations or "handler_refuse" in operations):
+            if self._is_review_workitem(task_type, operations, required_operation):
                 return {"id": task.attrib["id"], "type": task_type}
         raise OAConnectorError("未找到当前登录账号可处理的流程 workitem")
+
+    def _find_review_workitem_by_regex(
+        self, current_node_xml: str, required_operation: Optional[str] = None
+    ) -> Optional[Dict[str, str]]:
+        task_pattern = re.compile(r"<task\b(?P<attrs>[^>]*)>(?P<body>.*?)</task>", re.I | re.S)
+        operation_pattern = re.compile(r"<operation\b(?P<attrs>[^>]*)/?>", re.I | re.S)
+        for task_match in task_pattern.finditer(current_node_xml):
+            task_attrs = self._attrs_from_text(task_match.group("attrs"))
+            task_type = task_attrs.get("type", "")
+            task_id = task_attrs.get("id", "")
+            if not task_id:
+                continue
+            operations = {
+                self._attrs_from_text(operation_match.group("attrs")).get("id")
+                for operation_match in operation_pattern.finditer(task_match.group("body"))
+            }
+            if self._is_review_workitem(task_type, operations, required_operation):
+                return {"id": task_id, "type": task_type}
+        return None
+
+    def _attrs_from_text(self, text: str) -> Dict[str, str]:
+        attrs: Dict[str, str] = {}
+        for match in re.finditer(r"""\b([:\w.-]+)\s*=\s*(["'])(.*?)\2""", text, re.S):
+            attrs[match.group(1)] = unescape(match.group(3))
+        return attrs
+
+    def _is_review_workitem(
+        self, task_type: str, operations: set[Optional[str]], required_operation: Optional[str] = None
+    ) -> bool:
+        if task_type != "reviewWorkitem":
+            return False
+        available_operations = {operation for operation in operations if operation}
+        if required_operation:
+            return required_operation in available_operations
+        return bool({"handler_pass", "handler_refuse"} & available_operations)
 
     def _current_node_id(self, tran_process_xml: str) -> str:
         root = ET.fromstring(tran_process_xml)

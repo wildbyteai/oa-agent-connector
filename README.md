@@ -12,6 +12,20 @@
 
 目标电脑需要能访问这个 GitHub 仓库。如果仓库是私有的，请先确保那台电脑已登录有权限的 GitHub 账号。
 
+## 重要配置
+
+MCP 配置里必须显式设置 `OA_AGENT_STATE_DIR`，并且必须是真实绝对路径。
+
+审批是两步操作：先准备，再确认。部分 Agent 客户端会让每次 MCP 调用运行在不同进程或不同沙箱里。如果没有固定 `OA_AGENT_STATE_DIR`，准备审批时保存的确认状态，确认审批时可能读不到。
+
+推荐不要手写这个路径，直接运行：
+
+```bash
+oa-agent-mcp-config --base-url "<OA_BASE_URL>"
+```
+
+把命令输出的 JSON 放到 Agent 客户端 MCP 配置里即可。macOS 和 Windows 都兼容。
+
 ## 用户怎么用
 
 配置完成后，用户只需要对 Agent 说：
