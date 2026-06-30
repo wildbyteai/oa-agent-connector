@@ -34,6 +34,42 @@ oa-agent-mcp
 
 这个命令是 MCP stdio server，直接运行时会等待 MCP 客户端输入；普通用户不需要手动常驻运行。
 
+## 给其他 Agent 的直接安装提示词
+
+把下面这段发给另一台电脑上的 Agent。把 `<GITHUB_REPO_URL>` 和 `<OA_BASE_URL>` 替换为真实值：
+
+```text
+请通过 GitHub 安装并配置 OA MCP 连接器。
+
+GitHub 仓库地址：<GITHUB_REPO_URL>
+OA 地址：<OA_BASE_URL>
+
+请按以下步骤执行：
+
+1. 运行：
+   python3 -m pip install "git+<GITHUB_REPO_URL>"
+
+2. 在当前 Agent 客户端中添加 MCP 配置：
+   {
+     "mcpServers": {
+       "oa": {
+         "command": "oa-agent-mcp",
+         "env": {
+           "OA_BASE_URL": "<OA_BASE_URL>"
+         }
+       }
+     }
+   }
+
+3. 刷新或重启 Agent 客户端，让 MCP 生效。
+
+4. 然后我会说“查看我的 OA 待办”。如果还没有授权，请引导我输入自己的 OA 账号和密码完成登录。密码只用于本次登录，不要保存。
+
+5. 查询待办、查看详情、处理审批时，请遵守：只基于当前登录账号权限；审批必须先整理确认摘要；我明确回复“确认审批”或“确认驳回”后才允许提交。
+```
+
+如果仓库是私有仓库，目标电脑需要先具备 GitHub 访问权限，例如已登录 GitHub CLI 或已配置可访问该仓库的凭据。
+
 ## MCP 配置
 
 安装后推荐配置：
