@@ -101,8 +101,8 @@ oa-agent-mcp
 {
   "items": [
     {
-      "fdId": "17f4866c6985d9b8bf95a41433f8249a",
-      "subject": "请假申请_程林(带薪年假：1天)",
+      "fdId": "00000000000000000000000000000001",
+      "subject": "请假申请_示例员工(带薪年假：1天)",
       "raw": {}
     }
   ],
@@ -174,7 +174,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 ```json
 {
-  "fdId": "17f4866c6985d9b8bf95a41433f8249a",
+  "fdId": "00000000000000000000000000000001",
   "action": "approve",
   "note": "同意",
   "session": "default"
@@ -185,7 +185,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 ```json
 {
-  "fdId": "17f4866c6985d9b8bf95a41433f8249a",
+  "fdId": "00000000000000000000000000000001",
   "action": "reject",
   "note": "资料不完整，请补充后再提交",
   "session": "default"

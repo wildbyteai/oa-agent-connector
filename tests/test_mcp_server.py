@@ -26,7 +26,7 @@ class FakeClient:
             OATodo(
                 "1234567890abcdef1234567890abcdef",
                 "采购审批",
-                raw={"nodeName": "<div>部门负责人</div>", "handlerName": "<div>张三</div>"},
+                raw={"nodeName": "<div>部门负责人</div>", "handlerName": "<div>审批人A</div>"},
             )
         ]
 
