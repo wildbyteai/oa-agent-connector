@@ -95,6 +95,7 @@ def _mcp_error(data: Any) -> Dict[str, Any]:
 
 def _setup_guide(reason: str = "") -> Dict[str, Any]:
     example_base_url = os.getenv("OA_BASE_URL") or "<OA_BASE_URL>"
+    example_state_dir = os.getenv("OA_AGENT_STATE_DIR") or str(_state_dir())
     return {
         "ok": False,
         "reason": reason,
@@ -102,12 +103,15 @@ def _setup_guide(reason: str = "") -> Dict[str, Any]:
             {
                 "step": 1,
                 "title": "确认 MCP 已配置",
-                "description": "如果客户端根本没有 oa / oa-agent-mcp 这个 MCP，先在 MCP 客户端配置里添加它。",
+                "description": "如果客户端根本没有 oa / oa-agent-mcp 这个 MCP，先在 MCP 客户端配置里添加它。OA_AGENT_STATE_DIR 必须是这台电脑上的真实绝对路径，用来保存登录状态和审批确认状态。",
                 "exampleConfig": {
                     "mcpServers": {
                         "oa": {
                             "command": "oa-agent-mcp",
-                            "env": {"OA_BASE_URL": example_base_url},
+                            "env": {
+                                "OA_BASE_URL": example_base_url,
+                                "OA_AGENT_STATE_DIR": example_state_dir,
+                            },
                         }
                     }
                 },
@@ -229,7 +233,7 @@ TOOLS = [
         "oa_login",
         "登录 OA 并保存当前用户会话 cookie。不会保存密码。",
         {
-            "baseUrl": {"type": "string", "description": "OA 根地址，例如 https://oa.example.com/"},
+            "baseUrl": {"type": "string", "description": "OA 根地址，例如 https://example.com/oa/"},
             "username": {"type": "string", "description": "OA 登录账号"},
             "password": {"type": "string", "description": "OA 登录密码"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},

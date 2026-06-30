@@ -6,13 +6,13 @@ from oa_agent_connector.client import OAClient, PermissionGateError
 
 class FakeOAClient(OAClient):
     def __init__(self, todo_text):
-        super().__init__("https://oa.example.test/")
+        super().__init__("https://example.invalid/oa/")
         self.todo_text = todo_text
 
     def _request(self, path, method="GET", params=None, data=None):
         if params and params.get("method") == "list":
-            return {"url": "https://oa.example.test/list", "text": self.todo_text}
-        return {"url": "https://oa.example.test/ok", "text": "ok"}
+            return {"url": "https://example.invalid/oa/list", "text": self.todo_text}
+        return {"url": "https://example.invalid/oa/ok", "text": "ok"}
 
 
 class OAClientTest(unittest.TestCase):

@@ -68,7 +68,7 @@ class MCPServerTest(unittest.TestCase):
                             "params": {
                                 "name": "oa_login",
                                 "arguments": {
-                                    "baseUrl": "http://oa.example.test/",
+                                    "baseUrl": "https://example.invalid/oa/",
                                     "username": "u",
                                     "password": "p",
                                 },
@@ -118,7 +118,7 @@ class MCPServerTest(unittest.TestCase):
                             "params": {
                                 "name": "oa_login",
                                 "arguments": {
-                                    "baseUrl": "http://oa.example.test/",
+                                    "baseUrl": "https://example.invalid/oa/",
                                     "username": "u",
                                     "password": "p",
                                 },
@@ -152,7 +152,7 @@ class MCPServerTest(unittest.TestCase):
                             "params": {
                                 "name": "oa_login",
                                 "arguments": {
-                                    "baseUrl": "http://oa.example.test/",
+                                    "baseUrl": "https://example.invalid/oa/",
                                     "username": "u",
                                     "password": "p",
                                 },
@@ -198,7 +198,7 @@ class MCPServerTest(unittest.TestCase):
 
     def test_direct_execute_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
                 with patch.object(mcp_server, "OAClient", FakeClient):
                     response = mcp_server.handle(
                         {

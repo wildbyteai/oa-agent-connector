@@ -33,7 +33,32 @@ oa-agent-mcp
 
 该命令是 stdio MCP server，直接运行时会等待 MCP 客户端输入 JSON-RPC 消息。
 
+安装后还应能运行配置生成命令：
+
+```bash
+oa-agent-mcp-config --base-url "<OA_BASE_URL>"
+```
+
+这个命令会按当前电脑生成带真实 `OA_AGENT_STATE_DIR` 的 MCP 配置。macOS/Linux 和 Windows 都使用当前用户目录下的 `.oa-agent-connector`。
+
 ## MCP 客户端配置
+
+安装 Agent 应优先运行：
+
+```bash
+oa-agent-mcp-config --base-url "<OA_BASE_URL>"
+```
+
+然后把命令输出的 JSON 写入 MCP 客户端配置。
+
+如果需要手动写配置，必须在目标电脑上生成真实绝对路径，并写入 `OA_AGENT_STATE_DIR`。
+
+路径规则：
+
+- macOS/Linux：当前用户主目录下的 `.oa-agent-connector`，例如 `/Users/yourname/.oa-agent-connector`
+- Windows：当前用户目录下的 `.oa-agent-connector`，例如 `C:\\Users\\yourname\\.oa-agent-connector`
+
+`<ABSOLUTE_STATE_DIR>` 是文档占位符，实际配置时不能原样保留。
 
 示例配置：
 
@@ -43,14 +68,15 @@ oa-agent-mcp
     "oa": {
       "command": "oa-agent-mcp",
       "env": {
-        "OA_BASE_URL": "<OA_BASE_URL>"
+        "OA_BASE_URL": "<OA_BASE_URL>",
+        "OA_AGENT_STATE_DIR": "<ABSOLUTE_STATE_DIR>"
       }
     }
   }
 }
 ```
 
-如果不想依赖环境变量，也可以在每次工具调用中传 `baseUrl`。
+`OA_BASE_URL` 由用户提供，`OA_AGENT_STATE_DIR` 由安装 Agent 按当前电脑系统和用户名生成。
 
 ## 第一次授权连接
 
@@ -75,11 +101,11 @@ oa-agent-mcp
 }
 ```
 
-密码不会保存。MCP 只保存登录后的 cookie 和 baseUrl：
+密码不会保存。MCP 只保存登录后的 cookie、baseUrl 和待确认审批状态：
 
-- 默认目录：`~/.oa-agent-connector/`
+- 推荐目录：MCP 配置里的 `OA_AGENT_STATE_DIR`
 - cookie 文件权限会尽量设置为 `0600`
-- 如需换目录，可设置 `OA_AGENT_STATE_DIR`
+- 不建议省略 `OA_AGENT_STATE_DIR`；不同 MCP 调用可能处在不同沙箱，固定绝对路径可以保证“准备审批”和“确认审批”读写同一份确认状态。
 - MCP 不会因为一次查询失败或鉴权提示就删除 cookie；会保留原文件并引导用户重新登录。
 - 只有用户明确清理会话，或后续实现能确认服务端会话已彻底失效并需要重置时，才应删除 cookie。
 

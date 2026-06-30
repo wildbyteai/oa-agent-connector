@@ -3,7 +3,8 @@
     "oa": {
       "command": "oa-agent-mcp",
       "env": {
-        "OA_BASE_URL": "<OA_BASE_URL>"
+        "OA_BASE_URL": "<OA_BASE_URL>",
+        "OA_AGENT_STATE_DIR": "<ABSOLUTE_STATE_DIR>"
       }
     }
   }

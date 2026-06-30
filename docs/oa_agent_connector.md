@@ -20,7 +20,8 @@
 ## 用法
 
 ```bash
-export OA_BASE_URL="https://oa.example.com/"
+export OA_BASE_URL="https://example.com/oa/"
+export OA_AGENT_STATE_DIR="$HOME/.oa-agent-connector"
 python3 -m oa_agent_connector.cli login --username "zhangsan"
 python3 -m oa_agent_connector.cli todos
 python3 -m oa_agent_connector.cli detail "fd_id_here"
@@ -30,6 +31,19 @@ python3 -m oa_agent_connector.cli reject "fd_id_here" --note "不同意，原因
 ```
 
 登录 cookie 默认保存在当前目录 `.oa-session.cookies`，文件权限会尽量设置为 `0600`。也可以用 `OA_COOKIE_FILE` 或 `--cookie-file` 指定。连接器不会因为一次请求失败或鉴权提示就删除 cookie；失效时先提示重新登录，只有用户明确清理会话或实现能确认服务端会话必须重置时才删除。
+
+MCP 模式建议始终配置 `OA_AGENT_STATE_DIR` 为目标电脑上的真实绝对路径：
+
+- macOS/Linux：当前用户主目录下的 `.oa-agent-connector`
+- Windows：当前用户目录下的 `.oa-agent-connector`
+
+这个目录用于保存 MCP 登录 cookie、OA 地址和审批确认状态，确保不同 MCP 调用能读写同一份状态。
+
+可用下面的命令在目标电脑上生成 MCP 配置：
+
+```bash
+oa-agent-mcp-config --base-url "<OA_BASE_URL>"
+```
 
 ## Agent 工具封装建议
 

@@ -7,7 +7,7 @@
 把下面这句话发给另一台电脑上的 Agent 即可：
 
 ```text
-请安装并配置 OA 待办助手连接器：[wildbyteai/oa-agent-connector.git](https://github.com/wildbyteai/oa-agent-connector.git)。安装后先向我询问 OA 地址，并把它配置为 OA_BASE_URL；然后配置 MCP 命令 oa-agent-mcp。配置完成后，我会说“查看我的 OA 待办”，你再引导我用自己的 OA 账号登录授权。
+请安装并配置 OA 待办助手连接器：[wildbyteai/oa-agent-connector.git](https://github.com/wildbyteai/oa-agent-connector.git)。安装后先向我询问 OA 地址，然后运行 oa-agent-mcp-config --base-url "<我提供的OA地址>" 生成 MCP 配置；这个命令会自动写入这台电脑真实的 OA_AGENT_STATE_DIR，macOS 和 Windows 都兼容，不要手写占位符。把生成的 MCP 配置加入 Agent 客户端并刷新工具。配置完成后，我会说“查看我的 OA 待办”，你再引导我用自己的 OA 账号登录授权。
 ```
 
 目标电脑需要能访问这个 GitHub 仓库。如果仓库是私有的，请先确保那台电脑已登录有权限的 GitHub 账号。
@@ -72,9 +72,30 @@ oa-agent-mcp
 
 普通用户不需要手动运行这个命令。它是给支持 MCP 的 Agent 客户端调用的。
 
+还会得到一个配置生成命令：
+
+```bash
+oa-agent-mcp-config --base-url "<OA_BASE_URL>"
+```
+
+这个命令会输出已经带有本机真实 `OA_AGENT_STATE_DIR` 的 MCP 配置。macOS/Linux 会使用当前用户主目录下的 `.oa-agent-connector`，Windows 会使用当前用户目录下的 `.oa-agent-connector`。
+
 ## MCP 配置
 
-让用户自己提供 OA 地址，然后填到 `<OA_BASE_URL>`：
+让用户自己提供 OA 地址，然后优先运行：
+
+```bash
+oa-agent-mcp-config --base-url "<OA_BASE_URL>"
+```
+
+把命令输出的 JSON 加到 Agent 客户端配置里。`OA_AGENT_STATE_DIR` 会是目标电脑上的真实固定绝对路径，用于保存登录 cookie 和审批确认状态，避免不同沙箱或不同 MCP 调用之间状态不可见。
+
+如果需要手动写配置，安装 Agent 必须在配置时把路径算出来并写进去，不要把 `<ABSOLUTE_STATE_DIR>` 原样留在配置里。
+
+推荐路径：
+
+- macOS/Linux：当前用户主目录下的 `.oa-agent-connector`，例如 `/Users/yourname/.oa-agent-connector`
+- Windows：当前用户目录下的 `.oa-agent-connector`，例如 `C:\\Users\\yourname\\.oa-agent-connector`
 
 ```json
 {
@@ -82,7 +103,8 @@ oa-agent-mcp
     "oa": {
       "command": "oa-agent-mcp",
       "env": {
-        "OA_BASE_URL": "<OA_BASE_URL>"
+        "OA_BASE_URL": "<OA_BASE_URL>",
+        "OA_AGENT_STATE_DIR": "<ABSOLUTE_STATE_DIR>"
       }
     }
   }

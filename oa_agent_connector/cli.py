@@ -11,7 +11,7 @@ from .client import OAClient, OAConnectorError
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="oa-agent", description="OA agent connector using existing OA endpoints")
-    parser.add_argument("--base-url", default=os.getenv("OA_BASE_URL"), help="OA base URL, e.g. https://oa.example.com/")
+    parser.add_argument("--base-url", default=os.getenv("OA_BASE_URL"), help="OA base URL, e.g. https://example.com/oa/")
     parser.add_argument("--cookie-file", default=os.getenv("OA_COOKIE_FILE", ".oa-session.cookies"))
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
     sub = parser.add_subparsers(dest="command", required=True)
