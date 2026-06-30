@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "oa": {
+      "command": "python3",
+      "args": ["-m", "oa_agent_connector.mcp_server"],
+      "env": {
+        "PYTHONPATH": "<repo_dir>",
+        "OA_BASE_URL": "<OA_BASE_URL>"
+      }
+    }
+  }
+}
