@@ -258,7 +258,7 @@ class SearchMCPServerTest(unittest.TestCase):
                 return {"items": [], "summary": {"totalQueries": len(queries), "matchedQueries": 0, "errors": 0, "downloads": 0}}
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
                 with patch.object(mcp_server, "OAClient", SearchFakeClient):
                     schema = mcp_server.handle({
                         "jsonrpc": "2.0",
@@ -317,7 +317,7 @@ class SearchMCPServerTest(unittest.TestCase):
         ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
                 with patch.object(mcp_server, "OAClient", TrackingClient):
                     call_count["n"] = 0
                     for payload in bypass_payloads:
@@ -343,7 +343,7 @@ class SensitiveOutputRegressionTest(unittest.TestCase):
                 raise RuntimeError("Cookie: abc; Set-Cookie: def; JSESSIONID=ghi; Authorization: Bearer token; <html>full</html>")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
                 with patch.object(mcp_server, "OAClient", LeakyClient):
                     response = mcp_server.handle({
                         "jsonrpc": "2.0",
@@ -362,7 +362,7 @@ class SensitiveOutputRegressionTest(unittest.TestCase):
 
     def test_existing_direct_execute_is_still_blocked(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
                 with patch.object(mcp_server, "OAClient", FakeClient):
                     response = mcp_server.handle({
                         "jsonrpc": "2.0",

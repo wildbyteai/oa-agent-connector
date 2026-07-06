@@ -366,27 +366,33 @@ class OAClient:
             record_ref = self._record_ref_from_search_row(row, validated["scope"])
             if not record_ref:
                 continue
-            fields = row.get("lksFieldsMap") if isinstance(row.get("lksFieldsMap"), dict) else {}
             title = self._clean_search_title(
-                fields.get("subject") or row.get("subject") or row.get("docSubject") or row.get("title") or ""
+                self._search_row_value(row, "subject")
+                or self._search_row_value(row, "docSubject")
+                or self._search_row_value(row, "title")
+                or self._search_row_value(row, "fileName")
             )
             matched_exact = title == validated["query"] if validated["exactTitle"] else False
             if validated["onlyExactTitle"] and not matched_exact:
                 continue
             model_name = str(record_ref.get("modelName") or row.get("modelName") or "")
             supports_detail, supports_attachments = self._model_capabilities(validated["scope"], model_name)
-            summary = self._strip_html(str(row.get("content") or row.get("fdDescription") or ""))[:300]
-            read_count = self._to_int(row.get("docReadCount") or row.get("readCount"))
+            summary = self._strip_html(
+                self._search_row_value(row, "content")
+                or self._search_row_value(row, "fdDescription")
+                or self._search_row_value(row, "fullText")
+            )[:300]
+            read_count = self._to_int(self._search_row_value(row, "docReadCount") or self._search_row_value(row, "readCount"))
             items.append(
                 {
                     "recordRef": record_ref,
                     "fdId": record_ref["recordId"],
                     "title": title,
                     "summary": summary,
-                    "creator": self._strip_html(str(row.get("creator") or "")),
-                    "createTime": str(row.get("createTime") or ""),
+                    "creator": self._strip_html(self._search_row_value(row, "creator")),
+                    "createTime": self._search_row_value(row, "createTime"),
                     "readCount": read_count,
-                    "modelTitle": str(row.get("modelTitle") or ""),
+                    "modelTitle": self._search_row_value(row, "modelTitle") or self._search_row_value(row, "modelName2"),
                     "matchedExactTitle": matched_exact,
                     "supportsDetail": supports_detail,
                     "supportsAttachments": supports_attachments,
@@ -403,17 +409,30 @@ class OAClient:
         }
 
     def _record_ref_from_search_row(self, row: Dict[str, Any], scope: str) -> Optional[Dict[str, str]]:
-        model_name = str(row.get("modelName") or "")
-        path = str(row.get("linkStr") or "")
+        model_name = self._search_row_value(row, "modelName")
+        path = self._search_row_value(row, "linkStr")
         if not path.startswith("/") or path.startswith("//") or ".." in path.split("?")[0].split("/"):
             return None
-        record_id = str(row.get("docKey") or "").strip()
+        match = re.search(r"(?:fdId=|fdId/)([0-9a-fA-F]{24,40})", path)
+        record_id = match.group(1) if match else ""
         if not record_id:
-            match = re.search(r"(?:fdId=|fdId/)([0-9a-fA-F]{24,40})", path)
-            record_id = match.group(1) if match else ""
+            doc_key = self._search_row_value(row, "docKey")
+            ids = re.findall(r"[0-9a-fA-F]{24,40}", doc_key)
+            record_id = ids[0] if ids else ""
         if not record_id:
             return None
         return {"scope": scope, "modelName": model_name, "recordId": record_id, "path": path}
+
+    def _search_row_value(self, row: Dict[str, Any], key: str) -> str:
+        for source in (row, row.get("lksFieldsMap") if isinstance(row.get("lksFieldsMap"), dict) else {}):
+            if not isinstance(source, dict) or key not in source:
+                continue
+            value = source.get(key)
+            if isinstance(value, dict):
+                value = value.get("value")
+            if value is not None:
+                return unescape(str(value))
+        return ""
 
     def _model_capabilities(self, scope: str, model_name: str) -> tuple[bool, bool]:
         config = self._scope_config(scope)
@@ -421,6 +440,8 @@ class OAClient:
             allowed = config.get("allowedModelNames", [])
             if model_name in allowed or model_name.endswith("KmsMultidocKnowledge"):
                 return True, True
+        if model_name.endswith("KmsMultidocKnowledge"):
+            return True, True
         return False, False
 
     def _clean_search_title(self, value: Any) -> str:
@@ -513,11 +534,18 @@ class OAClient:
             args = self._parse_js_string_args(match.group(1))
             if len(args) < 3:
                 continue
-            attachment_id = args[0]
-            file_id = args[1] if len(args) > 1 else ""
-            name = args[2] if len(args) > 2 else ""
-            mime_type = args[3] if len(args) > 3 else ""
-            size = self._to_int(args[4]) if len(args) > 4 else None
+            if len(args) >= 4 and self._looks_like_filename(args[0]) and self._looks_like_mime_type(args[2]):
+                name = args[0]
+                attachment_id = args[1]
+                file_id = args[4] if len(args) > 4 and re.fullmatch(r"[0-9a-fA-F]{24,40}", args[4]) else ""
+                mime_type = args[2]
+                size = self._to_int(args[3])
+            else:
+                attachment_id = args[0]
+                file_id = args[1] if len(args) > 1 else ""
+                name = args[2] if len(args) > 2 else ""
+                mime_type = args[3] if len(args) > 3 else ""
+                size = self._to_int(args[4]) if len(args) > 4 else None
             attachments.append(
                 {
                     "index": len(attachments) + 1,
@@ -530,6 +558,12 @@ class OAClient:
                 }
             )
         return attachments
+
+    def _looks_like_filename(self, value: str) -> bool:
+        return bool(re.search(r"\.[A-Za-z0-9]{1,8}$", value or ""))
+
+    def _looks_like_mime_type(self, value: str) -> bool:
+        return bool(re.match(r"^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$", value or ""))
 
     def _parse_js_string_args(self, text: str) -> List[str]:
         values: List[str] = []
@@ -561,7 +595,10 @@ class OAClient:
         try:
             return int(str(value).strip())
         except (TypeError, ValueError):
-            return None
+            try:
+                return int(float(str(value).strip()))
+            except (TypeError, ValueError):
+                return None
 
     def get_detail(self, fd_id: str, require_in_todo: bool = True) -> Dict[str, Any]:
         if require_in_todo:

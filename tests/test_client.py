@@ -207,13 +207,13 @@ class SearchValidationTest(unittest.TestCase):
 
 class FakeSearchClient(OAClient):
     def __init__(self, payload):
-        super().__init__("https://oa.example.test/")
+        super().__init__("https://example.invalid/oa/")
         self.payload = payload
         self.last_request = None
 
     def _request(self, path, method="GET", params=None, data=None):
         self.last_request = {"path": path, "method": method, "params": params or {}, "data": data}
-        return {"url": "https://oa.example.test/search", "text": json.dumps(self.payload, ensure_ascii=False)}
+        return {"url": "https://example.invalid/oa/search", "text": json.dumps(self.payload, ensure_ascii=False)}
 
 
 class SearchObjectsTest(unittest.TestCase):
@@ -225,7 +225,7 @@ class SearchObjectsTest(unittest.TestCase):
                     {
                         "lksFieldsMap": {"subject": "<em>出厂报告-产品A</em>"},
                         "content": "摘要内容",
-                        "creator": "张三",
+                        "creator": "示例用户A",
                         "createTime": "2026-07-01",
                         "docReadCount": "4",
                         "modelName": "com.landray.kmss.kms.multidoc.model.KmsMultidocKnowledge",
@@ -273,16 +273,57 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertEqual(client.last_request["params"]["sortOrder"], "desc")
         self.assertEqual(client.last_request["params"]["searchFields"], "subject,attachment")
 
+    def test_search_objects_parses_landray_lks_field_values(self):
+        payload = {
+            "queryPage": {
+                "totalrows": 1,
+                "list": [
+                    {
+                        "docId": "ignored",
+                        "lksFieldsMap": {
+                            "docKey": {
+                                "value": "com.landray.kmss.kms.multidoc.model.KmsMultidocKnowledge_18721823f0e840b54ca85da4cfeb56c6_18721823db8fad6093486154f38bc47e"
+                            },
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18721823f0e840b54ca85da4cfeb56c6"
+                            },
+                            "modelName": {"value": "com.landray.kmss.kms.multidoc.model.KmsMultidocKnowledge"},
+                            "modelName2": "cn-文档知识库",
+                            "fileName": {"value": "仓库考勤制度 &#40;2&#41;.doc"},
+                            "fullText": {"value": "任何补偿开除。<font>请假</font>流程"},
+                            "creator": {"value": "示例用户"},
+                            "createTime": {"value": "2023-03-27"},
+                        },
+                    }
+                ],
+            }
+        }
+        client = FakeSearchClient(payload)
+
+        result = client.search_objects(query="请假", scope="knowledge", pageSize=5)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(len(result["items"]), 1)
+        item = result["items"][0]
+        self.assertEqual(item["fdId"], "18721823f0e840b54ca85da4cfeb56c6")
+        self.assertEqual(item["title"], "仓库考勤制度 (2).doc")
+        self.assertIn("请假", item["summary"])
+        self.assertIn("流程", item["summary"])
+        self.assertEqual(item["creator"], "示例用户")
+        self.assertEqual(item["createTime"], "2023-03-27")
+        self.assertTrue(item["supportsDetail"])
+        self.assertTrue(item["supportsAttachments"])
+
 
 class FakeDetailClient(OAClient):
     def __init__(self, html_text):
-        super().__init__("https://oa.example.test/")
+        super().__init__("https://example.invalid/oa/")
         self.html_text = html_text
         self.last_request = None
 
     def _request(self, path, method="GET", params=None, data=None):
         self.last_request = {"path": path, "method": method, "params": params or {}, "data": data}
-        return {"url": "https://oa.example.test/detail", "text": self.html_text}
+        return {"url": "https://example.invalid/oa/detail", "text": self.html_text}
 
 
 class ObjectDetailTest(unittest.TestCase):
@@ -296,6 +337,7 @@ class ObjectDetailTest(unittest.TestCase):
           <script>
             attachmentObject_attachment.addDoc('att-1','file-1','附件一.pdf','application/pdf','200261');
             attachmentObject_attachment.addDoc("att-2","file-2","\\u9644\\u4ef6\\u4e8c.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document","1024");
+            attachmentObject_attachment.addDoc("\\u793A\\u4F8B\\u9644\\u4EF6.pdf","1710b67825225c4d93e765b4429afb93",true,"application/pdf","51567.0","1710b67451705fddd2624874bb1b55a4","0");
           </script>
         </body></html>
         """
@@ -313,13 +355,18 @@ class ObjectDetailTest(unittest.TestCase):
         self.assertIn("正文第一段", detail["text"])
         self.assertNotIn("hidden-token", detail["text"])
         self.assertNotIn("secret", detail["text"])
-        self.assertEqual(len(detail["attachments"]), 2)
+        self.assertEqual(len(detail["attachments"]), 3)
         self.assertEqual(detail["attachments"][0]["index"], 1)
         self.assertEqual(detail["attachments"][0]["name"], "附件一.pdf")
         self.assertEqual(detail["attachments"][0]["attachmentId"], "att-1")
         self.assertEqual(detail["attachments"][0]["fileId"], "file-1")
         self.assertEqual(detail["attachments"][0]["size"], 200261)
         self.assertNotIn("url", detail["attachments"][0])
+        self.assertEqual(detail["attachments"][2]["name"], "示例附件.pdf")
+        self.assertEqual(detail["attachments"][2]["attachmentId"], "1710b67825225c4d93e765b4429afb93")
+        self.assertEqual(detail["attachments"][2]["fileId"], "1710b67451705fddd2624874bb1b55a4")
+        self.assertEqual(detail["attachments"][2]["mimeType"], "application/pdf")
+        self.assertEqual(detail["attachments"][2]["size"], 51567)
 
     def test_validate_record_ref_rejects_unsafe_paths(self):
         client = FakeDetailClient("ok")
@@ -338,7 +385,7 @@ class ObjectDetailTest(unittest.TestCase):
 
 class FakeDownloadClient(OAClient):
     def __init__(self, detail_html, download_bytes):
-        super().__init__("https://oa.example.test/")
+        super().__init__("https://example.invalid/oa/")
         self.detail_html = detail_html
         # download_bytes 可以是 str（向后兼容）或 bytes
         if isinstance(download_bytes, bytes):
@@ -349,13 +396,13 @@ class FakeDownloadClient(OAClient):
 
     def _request(self, path, method="GET", params=None, data=None):
         self.requests.append({"path": path, "method": method, "params": params or {}, "data": data})
-        return {"url": "https://oa.example.test/detail", "text": self.detail_html}
+        return {"url": "https://example.invalid/oa/detail", "text": self.detail_html}
 
     def _request_bytes(self, path, method="GET", params=None, data=None):
         self.requests.append({"path": path, "method": method, "params": params or {}, "data": data})
         if "sys_att_main" in path:
-            return {"url": "https://oa.example.test/sys/attachment/sys_att_main/sysAttMain.do", "bytes": self.download_bytes}
-        return {"url": "https://oa.example.test/detail", "bytes": self.detail_html.encode("utf-8")}
+            return {"url": "https://example.invalid/oa/sys/attachment/sys_att_main/sysAttMain.do", "bytes": self.download_bytes}
+        return {"url": "https://example.invalid/oa/detail", "bytes": self.detail_html.encode("utf-8")}
 
 
 class AttachmentDownloadTest(unittest.TestCase):
@@ -387,7 +434,28 @@ class AttachmentDownloadTest(unittest.TestCase):
             self.assertTrue(Path(second["savedPath"]).exists())
             self.assertTrue(first["savedPath"].endswith("产品A.pdf"))
             self.assertTrue(second["savedPath"].endswith("产品A (1).pdf"))
-            self.assertEqual(first["bytes"], 3)
+
+    def test_download_attachment_supports_landray_filename_first_signature(self):
+        detail_html = """
+        <html><title>真实附件格式</title><body>
+        <script>attachmentObject_attachment.addDoc("真实附件.pdf","1710b67825225c4d93e765b4429afb93",true,"application/pdf","3.0","1710b67451705fddd2624874bb1b55a4","0");</script>
+        </body></html>
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeDownloadClient(detail_html, b"PDF")
+            ref = {
+                "scope": "knowledge",
+                "modelName": "KmsMultidocKnowledge",
+                "recordId": "18256d188087f3669a0808d440da67a6",
+                "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+            }
+            result = client.download_attachment(ref, attachment_index=1, output_dir=tmpdir, overwrite=False, max_bytes=10)
+
+            self.assertTrue(result["savedPath"].endswith("真实附件.pdf"))
+            download_request = client.requests[-1]["path"]
+            self.assertIn("fdId=1710b67825225c4d93e765b4429afb93", download_request)
+            self.assertNotIn("fdId=%E7%9C%9F%E5%AE%9E%E9%99%84%E4%BB%B6.pdf", download_request)
+            self.assertEqual(result["bytes"], 3)
 
     def test_download_rejects_html_response_and_large_file(self):
         detail_html = """
