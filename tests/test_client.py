@@ -401,5 +401,89 @@ class AttachmentDownloadTest(unittest.TestCase):
                 large_client.download_attachment(ref, 1, tmpdir, max_bytes=10)
 
 
+class FakeBatchClient(FakeSearchClient):
+    def __init__(self):
+        super().__init__({})
+        self.downloads = []
+
+    def search_objects(self, **kwargs):
+        query = kwargs["query"]
+        if query == "bad":
+            raise OAConnectorError("搜索出现错误：模拟失败 Cookie=secret")
+        matched = query == "出厂报告-产品A"
+        return {
+            "query": query,
+            "items": [
+                {
+                    "recordRef": {
+                        "scope": "knowledge",
+                        "modelName": "KmsMultidocKnowledge",
+                        "recordId": "18256d188087f3669a0808d440da67a6",
+                        "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+                    },
+                    "title": query,
+                    "matchedExactTitle": matched,
+                    "attachments": [],
+                }
+            ] if matched else [],
+            "page": 1,
+            "pageSize": 5,
+            "total": 1 if matched else 0,
+        }
+
+    def get_object_detail(self, record_ref=None, include_text=True, text_limit=12000, fields=None, fd_id=None):
+        return {
+            "recordRef": record_ref,
+            "title": "出厂报告-产品A",
+            "text": "" if not include_text else "正文",
+            "textExtractionWarning": "",
+            "attachments": [{"index": 1, "name": "报告.pdf", "mimeType": "application/pdf", "size": 3, "downloadable": True}],
+        }
+
+    def download_attachment(self, record_ref, attachment_index, output_dir, overwrite=False, max_bytes=52428800, fd_id=None):
+        self.downloads.append(record_ref["recordId"])
+        return {"ok": True, "savedPath": str(Path(output_dir).expanduser() / "报告.pdf"), "bytes": 3}
+
+
+class BatchSearchObjectsTest(unittest.TestCase):
+    def test_batch_search_continues_after_single_error_and_sanitizes_error(self):
+        client = FakeBatchClient()
+        result = client.batch_search_objects(
+            queries=["出厂报告-产品A", "bad", "无结果"],
+            scope="knowledge",
+            modelName="KmsMultidocKnowledge",
+            bond="like",
+            exactTitle=True,
+            onlyExactTitle=True,
+            pageSize=5,
+            includeAttachments=True,
+            maxDetailsPerQuery=1,
+        )
+
+        self.assertEqual(result["summary"]["totalQueries"], 3)
+        self.assertEqual(result["summary"]["matchedQueries"], 1)
+        self.assertEqual(result["summary"]["errors"], 1)
+        self.assertEqual(result["items"][0]["results"][0]["attachments"][0]["name"], "报告.pdf")
+        self.assertNotIn("Cookie", result["items"][1]["error"])
+
+    def test_batch_download_requires_exact_title_and_positive_max_downloads(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeBatchClient()
+            result = client.batch_search_objects(
+                queries=["出厂报告-产品A"],
+                scope="knowledge",
+                modelName="KmsMultidocKnowledge",
+                bond="like",
+                exactTitle=True,
+                onlyExactTitle=True,
+                includeAttachments=True,
+                downloadFirstAttachment=True,
+                maxDownloads=1,
+                outputDir=tmpdir,
+            )
+            self.assertEqual(result["summary"]["downloads"], 1)
+            self.assertEqual(len(client.downloads), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

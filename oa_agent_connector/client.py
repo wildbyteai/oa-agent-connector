@@ -972,6 +972,102 @@ class OAClient:
                 return next_candidate
             counter += 1
 
+    def batch_search_objects(self, queries: List[str], **kwargs: Any) -> Dict[str, Any]:
+        if not isinstance(queries, list) or not queries:
+            raise OAConnectorError("queries 不能为空")
+        if len(queries) > SEARCH_LIMITS["batchQueriesMax"]:
+            raise OAConnectorError("queries 数量超过允许范围")
+        include_details = bool(kwargs.get("includeDetails", False))
+        include_attachments = bool(kwargs.get("includeAttachments", False))
+        download_first = bool(kwargs.get("downloadFirstAttachment", False))
+        max_details = int(kwargs.get("maxDetailsPerQuery") or SEARCH_LIMITS["maxDetailsPerQueryDefault"])
+        if max_details < 1 or max_details > SEARCH_LIMITS["maxDetailsPerQueryMax"]:
+            raise OAConnectorError("maxDetailsPerQuery 超过允许范围")
+        max_downloads = int(kwargs.get("maxDownloads") or SEARCH_LIMITS["batchMaxDownloadsDefault"])
+        if max_downloads < 0 or max_downloads > SEARCH_LIMITS["batchMaxDownloadsMax"]:
+            raise OAConnectorError("maxDownloads 超过允许范围")
+
+        items: List[Dict[str, Any]] = []
+        matched_queries = 0
+        errors = 0
+        downloads = 0
+        for query in queries:
+            item: Dict[str, Any] = {"query": query, "matched": False, "resultCount": 0, "results": [], "error": None}
+            try:
+                search_kwargs = dict(kwargs)
+                search_kwargs.pop("includeDetails", None)
+                search_kwargs.pop("includeAttachments", None)
+                search_kwargs.pop("downloadFirstAttachment", None)
+                search_kwargs.pop("maxDetailsPerQuery", None)
+                search_kwargs.pop("maxDownloads", None)
+                search_kwargs.pop("outputDir", None)
+                search_kwargs["query"] = query
+                search_kwargs["pageSize"] = int(kwargs.get("pageSize") or SEARCH_LIMITS["batchPageSizeDefault"])
+                result = self.search_objects(**search_kwargs)
+                results = result.get("items", [])
+                item["matched"] = bool(results)
+                item["resultCount"] = len(results)
+                if results:
+                    matched_queries += 1
+                for result_item in results[: max_details if (include_details or include_attachments or download_first) else len(results)]:
+                    compact: Dict[str, Any] = {
+                        "recordRef": result_item.get("recordRef"),
+                        "title": result_item.get("title"),
+                        "matchedExactTitle": result_item.get("matchedExactTitle", False),
+                        "attachments": [],
+                        "downloaded": [],
+                    }
+                    if include_details or include_attachments or download_first:
+                        detail = self.get_object_detail(record_ref=result_item["recordRef"], include_text=include_details)
+                        if include_details:
+                            compact["text"] = detail.get("text", "")
+                            compact["textExtractionWarning"] = detail.get("textExtractionWarning", "")
+                        if include_attachments or download_first:
+                            compact["attachments"] = detail.get("attachments", [])
+                    if download_first and compact["attachments"]:
+                        if (
+                            not kwargs.get("exactTitle")
+                            or not kwargs.get("onlyExactTitle")
+                            or not compact.get("matchedExactTitle")
+                        ):
+                            pass
+                        elif max_downloads <= 0 or downloads >= max_downloads:
+                            pass
+                        else:
+                            downloaded = self.download_attachment(
+                                result_item["recordRef"],
+                                attachment_index=int(compact["attachments"][0]["index"]),
+                                output_dir=str(kwargs.get("outputDir") or "~/Downloads/oa-attachments"),
+                                overwrite=bool(kwargs.get("overwrite", False)),
+                                max_bytes=int(kwargs.get("maxBytes") or SEARCH_LIMITS["downloadMaxBytesDefault"]),
+                            )
+                            compact["downloaded"].append(downloaded)
+                            downloads += 1
+                    item["results"].append(compact)
+            except Exception as exc:
+                errors += 1
+                item["error"] = self._sanitize_error(exc)
+            items.append(item)
+        return {
+            "items": items,
+            "summary": {
+                "totalQueries": len(queries),
+                "matchedQueries": matched_queries,
+                "errors": errors,
+                "downloads": downloads,
+            },
+        }
+
+    def _sanitize_error(self, exc: Exception) -> str:
+        text = str(exc)
+        text = re.sub(
+            r"(?i)(?:cookie|set-cookie|jsessionid|authorization|password|j_password)\s*[:=][^\s,;]+",
+            "[redacted]",
+            text,
+        )
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", text).strip()[:200]
+
     def download_attachment(
         self,
         record_ref: Optional[Dict[str, Any]],
