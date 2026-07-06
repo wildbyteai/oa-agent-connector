@@ -204,6 +204,12 @@ class SearchValidationTest(unittest.TestCase):
             client._validate_search_params({"query": "hello\rworld"})
         self.assertIn("搜索关键词不合法", str(ctx.exception))
 
+    def test_validate_search_params_rejects_bad_match_mode(self):
+        client = FakeOAClient("{}")
+        with self.assertRaises(OAConnectorError) as ctx:
+            client._validate_search_params({"query": "hello", "matchMode": "fuzzy"})
+        self.assertIn("标题匹配模式", str(ctx.exception))
+
 
 class FakeSearchClient(OAClient):
     def __init__(self, payload):
@@ -266,12 +272,109 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertTrue(item["supportsDetail"])
         self.assertTrue(item["supportsAttachments"])
         self.assertEqual(item["recordRef"]["path"], "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6")
+        self.assertEqual(item["normalizedTitle"], "出厂报告-产品A")
+        self.assertEqual(item["type"], "document")
+        self.assertEqual(item["attachmentCount"], 0)
         self.assertEqual(client.last_request["params"]["resultType"], "json")
         self.assertEqual(client.last_request["params"]["bond"], "like")
         self.assertEqual(client.last_request["params"]["docFileType"], "pdf")
         self.assertEqual(client.last_request["params"]["sortType"], "time")
         self.assertEqual(client.last_request["params"]["sortOrder"], "desc")
         self.assertEqual(client.last_request["params"]["searchFields"], "subject,attachment")
+
+    def test_search_objects_normalizes_cjk_spaces_for_contains_and_exact_modes(self):
+        payload = {
+            "queryPage": {
+                "totalrows": 2,
+                "list": [
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "三 草 两 木 白 管 星 钻 唇膏"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "无关文档"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=28256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                ],
+            }
+        }
+        client = FakeSearchClient(payload)
+
+        contains = client.search_objects(query="三草两木白管星钻唇膏", scope="knowledge", matchMode="contains")
+        exact = client.search_objects(query="三草两木白管星钻唇膏", scope="knowledge", matchMode="exact")
+        legacy = client.search_objects(query="三草两木白管星钻唇膏", scope="knowledge", onlyExactTitle=True)
+
+        self.assertEqual(len(contains["items"]), 1)
+        self.assertEqual(contains["items"][0]["title"], "三 草 两 木 白 管 星 钻 唇膏")
+        self.assertEqual(contains["items"][0]["normalizedTitle"], "三草两木白管星钻唇膏")
+        self.assertTrue(contains["items"][0]["matchedContainsTitle"])
+        self.assertEqual(contains["matchMode"], "contains")
+        self.assertEqual(len(exact["items"]), 1)
+        self.assertTrue(exact["items"][0]["matchedExactTitle"])
+        self.assertEqual(len(legacy["items"]), 1)
+        self.assertEqual(legacy["matchMode"], "exact")
+
+    def test_search_objects_dedups_attachment_rows_by_document_by_default(self):
+        payload = {
+            "queryPage": {
+                "totalrows": 3,
+                "list": [
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "产品资料.pdf"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "产品资料.jpg"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "产品资料"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                ],
+            }
+        }
+        client = FakeSearchClient(payload)
+
+        deduped = client.search_objects(query="产品资料", scope="knowledge", matchMode="contains")
+        raw = client.search_objects(query="产品资料", scope="knowledge", matchMode="contains", dedupByDocument=False)
+
+        self.assertTrue(deduped["dedupByDocument"])
+        self.assertEqual(deduped["filteredCount"], 3)
+        self.assertEqual(deduped["returnedCount"], 1)
+        self.assertEqual(len(deduped["items"]), 1)
+        self.assertEqual(deduped["items"][0]["title"], "产品资料")
+        self.assertEqual(deduped["items"][0]["type"], "document")
+        self.assertEqual(deduped["items"][0]["attachmentCount"], 2)
+        self.assertEqual(deduped["items"][0]["attachmentTitles"], ["产品资料.pdf", "产品资料.jpg"])
+        self.assertFalse(raw["dedupByDocument"])
+        self.assertEqual(len(raw["items"]), 3)
+        self.assertEqual([item["type"] for item in raw["items"]], ["attachment", "attachment", "document"])
 
     def test_search_objects_parses_landray_lks_field_values(self):
         payload = {

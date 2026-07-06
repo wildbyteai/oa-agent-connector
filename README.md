@@ -12,6 +12,14 @@
 
 目标电脑需要能访问这个 GitHub 仓库。如果仓库是私有的，请先确保那台电脑已登录有权限的 GitHub 账号。
 
+## 已安装旧版本怎么升级
+
+把下面这句话发给已经安装过旧版本的 Agent：
+
+```text
+请升级 OA 助手连接器：[wildbyteai/oa-agent-connector.git](https://github.com/wildbyteai/oa-agent-connector.git)。如果已安装旧版本，请执行 python3 -m pip install --upgrade --force-reinstall "git+https://github.com/wildbyteai/oa-agent-connector.git"；Windows 可用 py -m pip install --upgrade --force-reinstall "git+https://github.com/wildbyteai/oa-agent-connector.git"。升级后运行 oa-agent-mcp-config --base-url "<我提供的OA地址>" 重新生成 MCP 配置，确认配置里有真实的 OA_AGENT_STATE_DIR，然后刷新 Agent 客户端的 MCP 工具。不要删除已有 cookie，只有登录明确失效时才重新授权。
+```
+
 ## 重要配置
 
 MCP 配置里必须显式设置 `OA_AGENT_STATE_DIR`，并且必须是真实绝对路径。
@@ -59,6 +67,8 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 ```text
 在 OA 里搜索：示例产品
 ```
+
+用户说“完全匹配某个产品名”时，Agent 应优先使用 `matchMode=contains`，它会自动忽略 OA 标题里的空格，并按文档去重。`matchMode=exact` 表示标题去空格后必须和搜索词完全相等，适合标题非常确定的场景。
 
 继续查看和下载：
 

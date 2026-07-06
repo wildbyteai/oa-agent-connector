@@ -78,12 +78,14 @@ SEARCH_SCOPES = {
 }
 
 ALLOWED_BONDS = ("or", "and", "like")
+ALLOWED_MATCH_MODES = ("keyword", "contains", "exact")
 ALLOWED_SORT_TYPES = ("relevance", "readCount", "time")
 ALLOWED_SORT_ORDERS = ("asc", "desc")
 ALLOWED_TIME_RANGES = ("", "day", "week", "month", "year")
 ALLOWED_DOC_FILE_TYPES = ("", "pdf", "doc;docx", "xls;xlsx", "ppt;pptx", "txt")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+ATTACHMENT_TITLE_RE = re.compile(r"\.(?:pdf|docx?|xlsx?|pptx?|txt|jpe?g|png|gif|bmp|zip|rar|7z)(?:$|[\s)）\]}】])", re.I)
 
 
 class OAConnectorError(RuntimeError):
@@ -169,6 +171,7 @@ class OAClient:
             "models": list(config.get("models", [])),
             "searchFields": list(SEARCH_FIELD_MAP.keys()),
             "bond": list(ALLOWED_BONDS),
+            "matchMode": list(ALLOWED_MATCH_MODES),
             "sortTypes": list(ALLOWED_SORT_TYPES),
             "sortOrders": list(ALLOWED_SORT_ORDERS),
             "timeRanges": [value for value in ALLOWED_TIME_RANGES if value],
@@ -249,11 +252,21 @@ class OAClient:
         if page_size < 1 or page_size > max_page_size:
             raise OAConnectorError("pageSize 超过允许范围")
 
+        exact_title = self._bool_param(params.get("exactTitle"), False)
+        only_exact_title = self._bool_param(params.get("onlyExactTitle"), False)
+        match_mode = str(params.get("matchMode") or "").strip()
+        if not match_mode:
+            match_mode = "exact" if only_exact_title else "keyword"
+        if match_mode not in ALLOWED_MATCH_MODES:
+            raise OAConnectorError("不支持的标题匹配模式")
+
         return {
             "query": query,
+            "normalizedQuery": self._normalize_search_text(query),
             "scope": scope,
             "modelName": model_name,
             "bond": bond,
+            "matchMode": match_mode,
             "outKeyword": str(params.get("outKeyword") or ""),
             "searchFields": search_fields,
             "docFileType": doc_file_type,
@@ -264,8 +277,9 @@ class OAClient:
             "docStatus": str(params.get("docStatus") or ""),
             "sortType": sort_type,
             "sortOrder": sort_order,
-            "exactTitle": bool(params.get("exactTitle", False)),
-            "onlyExactTitle": bool(params.get("onlyExactTitle", False)),
+            "exactTitle": exact_title,
+            "onlyExactTitle": only_exact_title,
+            "dedupByDocument": self._bool_param(params.get("dedupByDocument"), True),
             "page": page,
             "pageSize": page_size,
         }
@@ -372,7 +386,13 @@ class OAClient:
                 or self._search_row_value(row, "title")
                 or self._search_row_value(row, "fileName")
             )
-            matched_exact = title == validated["query"] if validated["exactTitle"] else False
+            normalized_title = self._normalize_search_text(title)
+            matched_exact = normalized_title == validated["normalizedQuery"]
+            matched_contains = bool(validated["normalizedQuery"] and validated["normalizedQuery"] in normalized_title)
+            if validated["matchMode"] == "exact" and not matched_exact:
+                continue
+            if validated["matchMode"] == "contains" and not matched_contains:
+                continue
             if validated["onlyExactTitle"] and not matched_exact:
                 continue
             model_name = str(record_ref.get("modelName") or row.get("modelName") or "")
@@ -387,26 +407,103 @@ class OAClient:
                 {
                     "recordRef": record_ref,
                     "fdId": record_ref["recordId"],
+                    "type": self._search_result_type(row, title),
                     "title": title,
+                    "normalizedTitle": normalized_title,
                     "summary": summary,
                     "creator": self._strip_html(self._search_row_value(row, "creator")),
                     "createTime": self._search_row_value(row, "createTime"),
                     "readCount": read_count,
                     "modelTitle": self._search_row_value(row, "modelTitle") or self._search_row_value(row, "modelName2"),
                     "matchedExactTitle": matched_exact,
+                    "matchedContainsTitle": matched_contains,
+                    "attachmentCount": 0,
+                    "attachmentTitles": [],
                     "supportsDetail": supports_detail,
                     "supportsAttachments": supports_attachments,
                 }
             )
+        original_item_count = len(items)
+        if validated["dedupByDocument"]:
+            items = self._dedup_search_items(items)
         total = self._to_int(query_page.get("totalrows") if isinstance(query_page, dict) else None)
         return {
             "query": validated["query"],
+            "normalizedQuery": validated["normalizedQuery"],
+            "matchMode": validated["matchMode"],
+            "dedupByDocument": validated["dedupByDocument"],
             "items": items,
             "page": validated["page"],
             "pageSize": validated["pageSize"],
             "total": total if total is not None else len(items),
-            "totalNote": "以 OA 搜索接口返回为准",
+            "filteredCount": original_item_count,
+            "returnedCount": len(items),
+            "totalNote": "total 以 OA 搜索接口返回为准；items 已按本地 matchMode 和 dedupByDocument 处理",
         }
+
+    def _bool_param(self, value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "y", "on"):
+            return True
+        if text in ("0", "false", "no", "n", "off", ""):
+            return False
+        raise OAConnectorError("布尔参数格式不正确")
+
+    def _normalize_search_text(self, value: Any) -> str:
+        return re.sub(r"\s+", "", self._strip_html(str(value or "")))
+
+    def _search_result_type(self, row: Dict[str, Any], title: str) -> str:
+        if self._search_row_value(row, "fileName"):
+            return "attachment"
+        if ATTACHMENT_TITLE_RE.search(title or ""):
+            return "attachment"
+        return "document"
+
+    def _dedup_search_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        grouped: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for item in items:
+            fd_id = str(item.get("fdId") or "")
+            if not fd_id:
+                continue
+            if fd_id not in grouped:
+                grouped[fd_id] = {"best": item, "attachments": [], "seenAttachments": set()}
+                order.append(fd_id)
+            group = grouped[fd_id]
+            if self._search_item_better(item, group["best"]):
+                group["best"] = item
+            if item.get("type") == "attachment":
+                title = str(item.get("title") or "").strip()
+                if title and title not in group["seenAttachments"]:
+                    group["seenAttachments"].add(title)
+                    group["attachments"].append(title)
+
+        deduped: List[Dict[str, Any]] = []
+        for fd_id in order:
+            group = grouped[fd_id]
+            item = dict(group["best"])
+            item["type"] = "document"
+            item["attachmentCount"] = len(group["attachments"])
+            item["attachmentTitles"] = list(group["attachments"])
+            deduped.append(item)
+        return deduped
+
+    def _search_item_better(self, candidate: Dict[str, Any], current: Dict[str, Any]) -> bool:
+        def score(item: Dict[str, Any]) -> tuple[int, int, int, int]:
+            return (
+                1 if item.get("type") == "document" else 0,
+                1 if item.get("matchedExactTitle") else 0,
+                1 if item.get("matchedContainsTitle") else 0,
+                -len(str(item.get("normalizedTitle") or "")),
+            )
+
+        return score(candidate) > score(current)
 
     def _record_ref_from_search_row(self, row: Dict[str, Any], scope: str) -> Optional[Dict[str, str]]:
         model_name = self._search_row_value(row, "modelName")
@@ -1088,8 +1185,13 @@ class OAClient:
                 for result_item in results[: max_details if (include_details or include_attachments or download_first) else len(results)]:
                     compact: Dict[str, Any] = {
                         "recordRef": result_item.get("recordRef"),
+                        "type": result_item.get("type"),
                         "title": result_item.get("title"),
+                        "normalizedTitle": result_item.get("normalizedTitle"),
                         "matchedExactTitle": result_item.get("matchedExactTitle", False),
+                        "matchedContainsTitle": result_item.get("matchedContainsTitle", False),
+                        "attachmentCount": result_item.get("attachmentCount", 0),
+                        "attachmentTitles": result_item.get("attachmentTitles", []),
                         "attachments": [],
                         "downloaded": [],
                     }
@@ -1101,9 +1203,12 @@ class OAClient:
                         if include_attachments or download_first:
                             compact["attachments"] = detail.get("attachments", [])
                     if download_first and compact["attachments"]:
+                        exact_download_allowed = (
+                            str(kwargs.get("matchMode") or "") == "exact"
+                            or self._bool_param(kwargs.get("onlyExactTitle"), False)
+                        )
                         if (
-                            not kwargs.get("exactTitle")
-                            or not kwargs.get("onlyExactTitle")
+                            not exact_download_allowed
                             or not compact.get("matchedExactTitle")
                         ):
                             pass

@@ -237,15 +237,22 @@ class SearchMCPServerTest(unittest.TestCase):
 
         search_props = by_name["oa_search_objects"]["inputSchema"]["properties"]
         self.assertIn("query", search_props)
+        self.assertEqual(search_props["scope"]["enum"], ["all", "knowledge", "news"])
+        self.assertEqual(search_props["matchMode"]["enum"], ["keyword", "contains", "exact"])
+        self.assertIn("dedupByDocument", search_props)
+        self.assertIn("title", search_props["searchFields"]["items"]["enum"])
         self.assertNotIn("baseUrl", search_props)
         self.assertNotIn("insecure", search_props)
 
     def test_search_tool_calls_delegate_to_client(self):
+        seen = {}
+
         class SearchFakeClient(FakeClient):
             def get_search_schema(self, scope="all"):
                 return {"scope": scope, "models": [], "searchFields": ["title"], "limits": {}}
 
             def search_objects(self, **kwargs):
+                seen["search"] = kwargs
                 return {"query": kwargs["query"], "items": [], "page": 1, "pageSize": 20, "total": 0}
 
             def get_object_detail(self, record_ref=None, include_text=True, text_limit=12000, fields=None, fd_id=None):
@@ -272,9 +279,19 @@ class SearchMCPServerTest(unittest.TestCase):
                         "jsonrpc": "2.0",
                         "id": 2,
                         "method": "tools/call",
-                        "params": {"name": "oa_search_objects", "arguments": {"query": "abc", "scope": "knowledge"}},
+                        "params": {
+                            "name": "oa_search_objects",
+                            "arguments": {
+                                "query": "abc",
+                                "scope": "knowledge",
+                                "matchMode": "contains",
+                                "dedupByDocument": False,
+                            },
+                        },
                     })
                     self.assertEqual(json.loads(searched["result"]["content"][0]["text"])["query"], "abc")
+                    self.assertEqual(seen["search"]["matchMode"], "contains")
+                    self.assertFalse(seen["search"]["dedupByDocument"])
 
                     batched = mcp_server.handle({
                         "jsonrpc": "2.0",

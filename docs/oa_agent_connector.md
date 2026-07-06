@@ -66,11 +66,12 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 ## 搜索与附件边界
 
-- `oa_search_objects` 只做 OA 当前账号权限内的只读搜索。
+- `oa_search_objects` 只做 OA 当前账号权限内的只读搜索；本地支持 `matchMode=keyword/contains/exact`，其中 `contains/exact` 会忽略标题空白。
+- `oa_search_objects` 默认 `dedupByDocument=true`，按 `fdId` 聚合同一文档下的附件级命中，并返回 `normalizedTitle`、`type`、`attachmentCount`、`attachmentTitles`。
 - `oa_get_object_detail` 只接受搜索结果返回的 `recordRef`，并校验路径必须是站内相对路径。
 - `oa_download_attachment` 会重新读取详情页附件列表，只下载其中可见附件。
 - 附件保存时会清理文件名里的路径穿越字符，并默认避免覆盖已有文件。
-- 如果 Agent 在 MCP 结果之外做了去空格、包含判断、去重等业务过滤，应明确告诉用户这是 Agent 二次处理，不是 OA 原始结果。
+- 如果 Agent 在 MCP 结果之外又做了额外业务过滤、改排序或隐藏结果，应明确告诉用户这是 Agent 二次处理，不是 OA 原始结果。
 
 ## MCP Server
 
