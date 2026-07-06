@@ -172,6 +172,36 @@ class SearchValidationTest(unittest.TestCase):
                 with self.assertRaises(OAConnectorError):
                     client._validate_search_params(case)
 
+    def test_validate_search_params_rejects_non_numeric_page(self):
+        client = FakeOAClient("{}")
+        with self.assertRaises(OAConnectorError) as ctx:
+            client._validate_search_params({"query": "test", "page": "abc"})
+        self.assertIn("page/pageSize", str(ctx.exception))
+
+    def test_validate_search_params_rejects_non_numeric_page_size(self):
+        client = FakeOAClient("{}")
+        with self.assertRaises(OAConnectorError) as ctx:
+            client._validate_search_params({"query": "test", "pageSize": "not-a-number"})
+        self.assertIn("page/pageSize", str(ctx.exception))
+
+    def test_validate_search_params_rejects_newline_in_query(self):
+        client = FakeOAClient("{}")
+        with self.assertRaises(OAConnectorError) as ctx:
+            client._validate_search_params({"query": "hello\nworld"})
+        self.assertIn("搜索关键词不合法", str(ctx.exception))
+
+    def test_validate_search_params_rejects_tab_in_query(self):
+        client = FakeOAClient("{}")
+        with self.assertRaises(OAConnectorError) as ctx:
+            client._validate_search_params({"query": "hello\tworld"})
+        self.assertIn("搜索关键词不合法", str(ctx.exception))
+
+    def test_validate_search_params_rejects_carriage_return_in_query(self):
+        client = FakeOAClient("{}")
+        with self.assertRaises(OAConnectorError) as ctx:
+            client._validate_search_params({"query": "hello\rworld"})
+        self.assertIn("搜索关键词不合法", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

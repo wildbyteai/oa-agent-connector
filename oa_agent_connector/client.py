@@ -82,7 +82,7 @@ ALLOWED_SORT_ORDERS = ("asc", "desc")
 ALLOWED_TIME_RANGES = ("", "day", "week", "month", "year")
 ALLOWED_DOC_FILE_TYPES = ("", "pdf", "doc;docx", "xls;xlsx", "ppt;pptx", "txt")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class OAConnectorError(RuntimeError):
@@ -238,8 +238,11 @@ class OAClient:
 
         default_page_size = SEARCH_LIMITS["batchPageSizeDefault"] if batch else SEARCH_LIMITS["pageSizeDefault"]
         max_page_size = SEARCH_LIMITS["batchPageSizeMax"] if batch else SEARCH_LIMITS["pageSizeMax"]
-        page = int(params.get("page") or 1)
-        page_size = int(params.get("pageSize") or default_page_size)
+        try:
+            page = int(params.get("page") or 1)
+            page_size = int(params.get("pageSize") or default_page_size)
+        except (ValueError, TypeError):
+            raise OAConnectorError("page/pageSize 必须为正整数")
         if page < 1:
             raise OAConnectorError("页码必须大于 0")
         if page_size < 1 or page_size > max_page_size:
