@@ -6,6 +6,9 @@
 - 待我审列表：`GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval&mydoc=approval`
 - 审批处理：`POST /api/km-review/kmReviewRestService/approveProcess`
 - 详情查看：`GET /km/review/km_review_main/kmReviewMain.do?method=view&fdId=...`
+- 通用搜索：`GET /sys/ftsearch/searchBuilder.do?method=search&resultType=json`
+- 文档详情：基于搜索结果返回的受控 `recordRef.path`
+- 附件下载：只基于详情页解析出的附件序号，不接受任意下载 URL
 
 ## 权限控制
 
@@ -52,10 +55,22 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 - `login(base_url, username, password)`
 - `list_todos(page, page_size)`
 - `get_detail(fd_id)`
+- `search_objects(query, scope, page, page_size)`
+- `get_object_detail(record_ref)`
+- `download_attachment(record_ref, attachment_index, output_dir)`
+- `batch_search_objects(queries, scope)`
 - `approve(fd_id, note, execute=false)`
 - `reject(fd_id, note, execute=false)`
 
-不要暴露原始 `flowParam`、`handler`、任意 URL 请求能力。需要扩展会签、转办、人工决策节点时，也应增加白名单参数，并继续保留“当前登录账号待审列表包含 fdId”的 gate。
+不要暴露原始 `flowParam`、`handler`、任意 URL 请求能力。搜索详情必须通过 MCP 返回的 `recordRef` 继续访问；附件下载必须通过详情页中的附件序号，不能接受用户手写下载 URL。需要扩展会签、转办、人工决策节点时，也应增加白名单参数，并继续保留“当前登录账号待审列表包含 fdId”的 gate。
+
+## 搜索与附件边界
+
+- `oa_search_objects` 只做 OA 当前账号权限内的只读搜索。
+- `oa_get_object_detail` 只接受搜索结果返回的 `recordRef`，并校验路径必须是站内相对路径。
+- `oa_download_attachment` 会重新读取详情页附件列表，只下载其中可见附件。
+- 附件保存时会清理文件名里的路径穿越字符，并默认避免覆盖已有文件。
+- 如果 Agent 在 MCP 结果之外做了去空格、包含判断、去重等业务过滤，应明确告诉用户这是 Agent 二次处理，不是 OA 原始结果。
 
 ## MCP Server
 

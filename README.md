@@ -1,13 +1,13 @@
-# OA 待办助手连接器
+# OA 助手连接器
 
-这个连接器让 Agent 可以帮用户处理 OA 待办：查看待办清单、查看申请详情，并在用户明确确认后提交审批同意或驳回。
+这个连接器让 Agent 可以帮用户使用 OA：查看待办清单、查看申请详情、在用户明确确认后提交审批同意或驳回；也可以搜索 OA 文档、查看文档详情、下载当前账号有权限看到的附件。
 
 ## 一句话给其他 Agent
 
 把下面这句话发给另一台电脑上的 Agent 即可：
 
 ```text
-请安装并配置 OA 待办助手连接器：[wildbyteai/oa-agent-connector.git](https://github.com/wildbyteai/oa-agent-connector.git)。安装后先向我询问 OA 地址，然后运行 oa-agent-mcp-config --base-url "<我提供的OA地址>" 生成 MCP 配置；这个命令会自动写入这台电脑真实的 OA_AGENT_STATE_DIR，macOS 和 Windows 都兼容，不要手写占位符。把生成的 MCP 配置加入 Agent 客户端并刷新工具。配置完成后，我会说“查看我的 OA 待办”，你再引导我用自己的 OA 账号登录授权。
+请安装并配置 OA 助手连接器：[wildbyteai/oa-agent-connector.git](https://github.com/wildbyteai/oa-agent-connector.git)。安装后先向我询问 OA 地址，然后运行 oa-agent-mcp-config --base-url "<我提供的OA地址>" 生成 MCP 配置；这个命令会自动写入这台电脑真实的 OA_AGENT_STATE_DIR，macOS 和 Windows 都兼容，不要手写占位符。把生成的 MCP 配置加入 Agent 客户端并刷新工具。配置完成后，我可以说“查看我的 OA 待办”，也可以说“在 OA 里搜索：关键词”，你再引导我用自己的 OA 账号登录授权。
 ```
 
 目标电脑需要能访问这个 GitHub 仓库。如果仓库是私有的，请先确保那台电脑已登录有权限的 GitHub 账号。
@@ -54,6 +54,22 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 驳回第 1 条，备注请补充资料
 ```
 
+也可以搜索 OA 文档：
+
+```text
+在 OA 里搜索：示例产品
+```
+
+继续查看和下载：
+
+```text
+打开第 1 条详情
+```
+
+```text
+下载第 1 条附件
+```
+
 审批不会直接提交。Agent 会先整理确认信息，用户必须明确回复下面的固定确认词后才会执行：
 
 - 同意：`确认审批`
@@ -64,6 +80,8 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 - 先登录授权，再查询和处理 OA。
 - 只使用当前登录账号能看到的待办。
 - 只允许查看当前账号待办里的申请详情。
+- 搜索、详情和附件下载只使用当前登录账号在 OA 里能访问到的内容。
+- 下载附件时只能下载详情页里列出的可见附件，不能让用户手写任意下载地址。
 - 审批前必须展示单据、动作、备注，让用户确认。
 - 用户没有明确回复 `确认审批` 或 `确认驳回`，不能提交。
 - 不保存用户密码。
@@ -133,6 +151,12 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 ```text
 查看我的 OA 待办
+```
+
+或：
+
+```text
+在 OA 里搜索：示例产品
 ```
 
 如果还没有登录，Agent 应提示：

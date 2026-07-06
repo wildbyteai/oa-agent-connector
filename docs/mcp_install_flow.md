@@ -6,6 +6,7 @@
 2. 在 MCP 客户端中配置 `oa-agent-mcp`。
 3. 用户用自己的 OA 账号调用 `oa_login` 授权连接。
 4. 调用 `oa_list_todos` 查询当前登录账号有权限看到的待审批清单。
+5. 需要搜索 OA 文档时，调用只读搜索、详情和附件下载工具，仍然只基于当前登录账号权限。
 
 对普通用户的标准回复话术见 [oa_mcp_user_output_standard.md](oa_mcp_user_output_standard.md)。Agent 面向用户输出时应使用自然语言，不直接展示 MCP 参数、JSON、token、fdId、HTTP 错误等技术内容。
 
@@ -167,11 +168,44 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 }
 ```
 
+## 用户直接说“在 OA 里搜索”
+
+推荐 agent 行为：
+
+1. 识别用户要在 OA 内部搜索，而不是网页搜索或本地文件搜索。
+2. 调用 `oa_search_objects`，默认使用 `scope=all`，按用户原话传入关键词。
+3. 展示 OA 返回的前几条结果，普通用户只看标题、创建人、时间和序号。
+4. 用户说“看第 1 条详情”时，使用搜索结果里的 `recordRef` 调用 `oa_get_object_detail`。
+5. 用户说“下载第 1 条附件”时，先确认该详情页里有附件，再用 `oa_download_attachment` 下载。
+
+推荐触发话术：
+
+```text
+在 OA 里搜索：示例产品
+```
+
+```text
+帮我查一下 OA 里有没有示例产品的出厂报告
+```
+
+```text
+在 OA 里搜索示例产品，打开第一条并下载附件
+```
+
+注意边界：
+
+- 搜索结果来自 OA 当前登录账号可见的数据。
+- `oa_search_objects` 不做业务理解上的“完全匹配”二次过滤；如果 Agent 自己做了去空格、包含判断、去重等处理，必须明确告诉用户这是 Agent 的二次处理。
+- 附件下载只能基于 `oa_get_object_detail` 返回的附件序号，不能接受任意下载 URL。
+- 下载目录应使用本机安全目录；不要覆盖用户已有文件，除非用户明确要求。
+
 ## 权限边界
 
 - 必须先 `oa_login`，后续查询使用该登录 cookie。
 - `oa_list_todos` 只返回 OA 现有接口对当前登录账号可见的数据。
 - `oa_get_detail` 默认要求 `fdId` 必须在当前登录账号待办清单中。
+- `oa_search_objects`、`oa_get_object_detail`、`oa_download_attachment` 只做当前账号权限内的只读搜索、详情查看和附件下载。
+- `oa_download_attachment` 只允许下载详情页里枚举出来的附件，不暴露任意 URL 下载能力。
 - MCP 正式审批必须走 `oa_prepare_approval` -> 用户确认 -> `oa_confirm_approval`。
 - `oa_prepare_approval` 会先确认 `fdId` 在当前登录账号待办清单中，并整理单据、动作、备注、当前节点、当前处理人。
 - `oa_confirm_approval` 执行前会再次查询当前登录账号待办清单，`fdId` 不在清单中则拒绝。
@@ -242,6 +276,11 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 - `oa_auth_status`：检查当前 session 是否仍有效。
 - `oa_list_todos`：查询当前登录账号待办清单。
 - `oa_get_detail`：查看待审批单据详情。
+- `oa_get_search_schema`：查看当前 MCP 支持的 OA 搜索范围、字段、排序和限制。
+- `oa_search_objects`：执行 OA 通用只读搜索，返回可继续查看详情的结果。
+- `oa_get_object_detail`：按搜索结果查看 OA 文档详情和附件列表。
+- `oa_download_attachment`：按详情页附件序号下载当前账号可见附件。
+- `oa_batch_search_objects`：批量执行 OA 搜索，可用于多关键词查找。
 - `oa_prepare_approval`：准备审批动作，生成待用户确认的摘要和 token。
 - `oa_confirm_approval`：用户确认后执行审批，执行前再次校验权限。
 - `oa_approve`：同意审批 dry-run 兼容工具，MCP 禁止直接执行。
