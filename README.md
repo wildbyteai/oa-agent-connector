@@ -2,22 +2,38 @@
 
 这个连接器让 Agent 可以帮用户使用 OA：查看待办清单、查看申请详情、在用户明确确认后提交审批同意或驳回；也可以搜索 OA 文档、查看文档详情、下载当前账号有权限看到的附件。
 
-## 一句话给其他 Agent
+## 一句话安装或升级
 
 把下面这句话发给另一台电脑上的 Agent 即可：
 
 ```text
-请安装并配置 OA 助手连接器：[wildbyteai/oa-agent-connector.git](https://github.com/wildbyteai/oa-agent-connector.git)。安装后先向我询问 OA 地址，然后运行 oa-agent-mcp-config --base-url "<我提供的OA地址>" 生成 MCP 配置；这个命令会自动写入这台电脑真实的 OA_AGENT_STATE_DIR，macOS 和 Windows 都兼容，不要手写占位符。把生成的 MCP 配置加入 Agent 客户端并刷新工具。配置完成后，我可以说“查看我的 OA 待办”，也可以说“在 OA 里搜索：关键词”，你再引导我用自己的 OA 账号登录授权。
+请安装或升级 OA 助手连接器：https://github.com/wildbyteai/oa-agent-connector.git
 ```
 
-目标电脑需要能访问这个 GitHub 仓库。如果仓库是私有的，请先确保那台电脑已登录有权限的 GitHub 账号。
+如果 Agent 支持从 GitHub 安装 MCP，它应自动读取本仓库 README，完成安装、升级、配置和授权引导。目标电脑需要能访问这个 GitHub 仓库。如果仓库是私有的，请先确保那台电脑已登录有权限的 GitHub 账号。
 
-## 已安装旧版本怎么升级
+## Agent 应该怎么执行
 
-把下面这句话发给已经安装过旧版本的 Agent：
+收到上面那句话后，Agent 应按下面流程处理：
 
-```text
-请升级 OA 助手连接器：[wildbyteai/oa-agent-connector.git](https://github.com/wildbyteai/oa-agent-connector.git)。如果已安装旧版本，请执行 python3 -m pip install --upgrade --force-reinstall "git+https://github.com/wildbyteai/oa-agent-connector.git"；Windows 可用 py -m pip install --upgrade --force-reinstall "git+https://github.com/wildbyteai/oa-agent-connector.git"。升级后运行 oa-agent-mcp-config --base-url "<我提供的OA地址>" 重新生成 MCP 配置，确认配置里有真实的 OA_AGENT_STATE_DIR，然后刷新 Agent 客户端的 MCP 工具。不要删除已有 cookie，只有登录明确失效时才重新授权。
+1. 如果未安装，安装本仓库；如果已安装旧版本，升级到本仓库最新版本。
+2. 向用户询问 OA 地址，不要使用仓库外的默认地址。
+3. 运行 `oa-agent-mcp-config --base-url "<用户提供的OA地址>"` 生成 MCP 配置。
+4. 确认配置里有这台电脑真实的 `OA_AGENT_STATE_DIR`，不要手写占位符。
+5. 把生成的 MCP 配置加入 Agent 客户端，并刷新或重启 MCP 工具。
+6. 引导用户用自己的 OA 账号登录授权。密码只用于登录，不保存。
+7. 不要主动删除已有 cookie，只有登录明确失效时才重新授权。
+
+安装或升级命令：
+
+```bash
+python3 -m pip install --upgrade --force-reinstall "git+https://github.com/wildbyteai/oa-agent-connector.git"
+```
+
+Windows 可用：
+
+```powershell
+py -m pip install --upgrade --force-reinstall "git+https://github.com/wildbyteai/oa-agent-connector.git"
 ```
 
 ## 重要配置

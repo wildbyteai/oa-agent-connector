@@ -4,6 +4,16 @@
 
 Agent 对用户的标准回复话术见 [oa_mcp_user_output_standard.md](oa_mcp_user_output_standard.md)。面向普通同事时，优先使用自然语言话术，不展示 MCP 参数、接口地址、token、fdId 等技术内容。
 
+## 一句话安装或升级
+
+把下面这句话发给 Agent：
+
+```text
+请安装或升级 OA 助手连接器：https://github.com/wildbyteai/oa-agent-connector.git
+```
+
+Agent 应按仓库 README 完成安装或升级，然后向用户询问 OA 地址，生成本机 MCP 配置，刷新工具，并引导用户用自己的 OA 账号登录授权。
+
 ## 一句话说明
 
 安装并授权 OA MCP 后，可以直接对 Agent 说：
