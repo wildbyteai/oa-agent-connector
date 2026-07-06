@@ -284,6 +284,57 @@ class SearchMCPServerTest(unittest.TestCase):
                     })
                     self.assertEqual(json.loads(batched["result"]["content"][0]["text"])["summary"]["totalQueries"], 2)
 
+    def test_new_search_tools_reject_bypass_params(self):
+        """新增 5 个工具注入 baseUrl/insecure 等参数应返回 isError，不调用 FakeClient。"""
+        call_count = {"n": 0}
+
+        class TrackingClient(FakeClient):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                call_count["n"] += 1
+
+            def get_search_schema(self, scope="all"):
+                return {"scope": scope}
+
+            def search_objects(self, **kwargs):
+                return {"query": kwargs["query"], "items": []}
+
+            def get_object_detail(self, record_ref=None, include_text=True, text_limit=12000, fields=None, fd_id=None):
+                return {"recordRef": record_ref, "title": "t", "text": "", "attachments": []}
+
+            def download_attachment(self, record_ref, attachment_index, output_dir, overwrite=False, max_bytes=52428800, fd_id=None):
+                return {"ok": True}
+
+            def batch_search_objects(self, queries, **kwargs):
+                return {"items": [], "summary": {"totalQueries": len(queries), "matchedQueries": 0, "errors": 0, "downloads": 0}}
+
+        bypass_payloads = [
+            {"name": "oa_get_search_schema", "arguments": {"scope": "all", "baseUrl": "https://evil.test/oa/"}},
+            {"name": "oa_search_objects", "arguments": {"query": "test", "insecure": True}},
+            {"name": "oa_get_object_detail", "arguments": {"recordRef": {"scope": "knowledge", "modelName": "KmsMultidocKnowledge", "recordId": "x", "path": "/x?fdId=x"}, "extraParams": "evil"}},
+            {"name": "oa_download_attachment", "arguments": {"recordRef": {"scope": "knowledge", "modelName": "KmsMultidocKnowledge", "recordId": "x", "path": "/x?fdId=x"}, "attachmentIndex": 1, "outputDir": "/tmp", "attachmentUrl": "https://evil.test/"}},
+            {"name": "oa_batch_search_objects", "arguments": {"queries": ["a"], "fileId": "evil"}},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", TrackingClient):
+                    call_count["n"] = 0
+                    for payload in bypass_payloads:
+                        with self.subTest(tool=payload["name"]):
+                            response = mcp_server.handle({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": payload,
+                            })
+                            result = response["result"]
+                            self.assertTrue(result["isError"], f"{payload['name']} 应返回 isError")
+                            text = result["content"][0]["text"]
+                            self.assertIn("不接受参数", text)
+                    # FakeClient 不应被实例化（OAClient 不应被调用）
+                    self.assertEqual(call_count["n"], 0)
+
 
 class SensitiveOutputRegressionTest(unittest.TestCase):
     def test_new_tool_error_output_does_not_leak_sensitive_patterns(self):

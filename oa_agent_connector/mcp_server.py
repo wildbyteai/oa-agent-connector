@@ -440,6 +440,35 @@ def _bool(args: Dict[str, Any], key: str, default: bool = False) -> bool:
     return bool(value)
 
 
+
+_NEW_SEARCH_TOOL_NAMES = frozenset({
+    "oa_get_search_schema",
+    "oa_search_objects",
+    "oa_get_object_detail",
+    "oa_download_attachment",
+    "oa_batch_search_objects",
+})
+
+_BYPASS_PARAM_KEYS = frozenset({
+    "baseUrl",
+    "insecure",
+    "extraParams",
+    "attachmentUrl",
+    "fileId",
+    "attachmentId",
+})
+
+
+def _reject_bypass_params(tool_name: str, args: Dict[str, Any]) -> None:
+    """Reject bypass parameters for new search tools."""
+    injected = _BYPASS_PARAM_KEYS & set(args.keys())
+    if injected:
+        raise OAConnectorError(
+            "工具 %s 不接受参数: %s" % (tool_name, ", ".join(sorted(injected)))
+        )
+
+
+
 def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     session = _session(args)
     insecure = _bool(args, "insecure")
@@ -479,59 +508,65 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         _delete_pending_approval(token)
         return _ok({"ok": True, "executed": True, "action": pending["action"], "fdId": pending["fdId"], "result": result})
 
-    client = _client(session=session, base_url=args.get("baseUrl"), insecure=insecure)
+    # New search tools: create client with session only, reject bypass params
+    if name in _NEW_SEARCH_TOOL_NAMES:
+        _reject_bypass_params(name, args)
+        client = _client(session=session)
 
-    if name == "oa_get_search_schema":
-        return _ok(client.get_search_schema(str(args.get("scope") or "all")))
-    if name == "oa_search_objects":
-        return _ok(
-            client.search_objects(
-                query=str(args["query"]),
-                scope=args.get("scope") or "all",
-                modelName=args.get("modelName"),
-                bond=args.get("bond") or "or",
-                searchFields=args.get("searchFields") or [],
-                category=args.get("category") or "",
-                docStatus=args.get("docStatus") or "",
-                docFileType=args.get("docFileType") or "",
-                outKeyword=args.get("outKeyword") or "",
-                timeRange=args.get("timeRange") or "",
-                fromCreateTime=args.get("fromCreateTime") or "",
-                toCreateTime=args.get("toCreateTime") or "",
-                sortType=args.get("sortType") or "relevance",
-                sortOrder=args.get("sortOrder") or "desc",
-                exactTitle=_bool(args, "exactTitle"),
-                onlyExactTitle=_bool(args, "onlyExactTitle"),
-                page=int(args.get("page") or 1),
-                pageSize=int(args.get("pageSize") or 20),
+        if name == "oa_get_search_schema":
+            return _ok(client.get_search_schema(str(args.get("scope") or "all")))
+        if name == "oa_search_objects":
+            return _ok(
+                client.search_objects(
+                    query=str(args["query"]),
+                    scope=args.get("scope") or "all",
+                    modelName=args.get("modelName"),
+                    bond=args.get("bond") or "or",
+                    searchFields=args.get("searchFields") or [],
+                    category=args.get("category") or "",
+                    docStatus=args.get("docStatus") or "",
+                    docFileType=args.get("docFileType") or "",
+                    outKeyword=args.get("outKeyword") or "",
+                    timeRange=args.get("timeRange") or "",
+                    fromCreateTime=args.get("fromCreateTime") or "",
+                    toCreateTime=args.get("toCreateTime") or "",
+                    sortType=args.get("sortType") or "relevance",
+                    sortOrder=args.get("sortOrder") or "desc",
+                    exactTitle=_bool(args, "exactTitle"),
+                    onlyExactTitle=_bool(args, "onlyExactTitle"),
+                    page=int(args.get("page") or 1),
+                    pageSize=int(args.get("pageSize") or 20),
+                )
             )
-        )
-    if name == "oa_get_object_detail":
-        return _ok(
-            client.get_object_detail(
-                record_ref=args.get("recordRef"),
-                include_text=_bool(args, "includeText", True),
-                text_limit=int(args.get("textLimit") or 12000),
-                fields=args.get("fields") or [],
-                fd_id=args.get("fdId"),
+        if name == "oa_get_object_detail":
+            return _ok(
+                client.get_object_detail(
+                    record_ref=args.get("recordRef"),
+                    include_text=_bool(args, "includeText", True),
+                    text_limit=int(args.get("textLimit") or 12000),
+                    fields=args.get("fields") or [],
+                    fd_id=args.get("fdId"),
+                )
             )
-        )
-    if name == "oa_download_attachment":
-        return _ok(
-            client.download_attachment(
-                record_ref=args.get("recordRef"),
-                attachment_index=int(args["attachmentIndex"]),
-                output_dir=str(args["outputDir"]),
-                overwrite=_bool(args, "overwrite"),
-                max_bytes=int(args.get("maxBytes") or 52428800),
-                fd_id=args.get("fdId"),
+        if name == "oa_download_attachment":
+            return _ok(
+                client.download_attachment(
+                    record_ref=args.get("recordRef"),
+                    attachment_index=int(args["attachmentIndex"]),
+                    output_dir=str(args["outputDir"]),
+                    overwrite=_bool(args, "overwrite"),
+                    max_bytes=int(args.get("maxBytes") or 52428800),
+                    fd_id=args.get("fdId"),
+                )
             )
-        )
-    if name == "oa_batch_search_objects":
-        batch_args = dict(args)
-        queries = list(batch_args.pop("queries"))
-        batch_args.pop("session", None)
-        return _ok(client.batch_search_objects(queries=queries, **batch_args))
+        if name == "oa_batch_search_objects":
+            batch_args = dict(args)
+            queries = list(batch_args.pop("queries"))
+            batch_args.pop("session", None)
+            return _ok(client.batch_search_objects(queries=queries, **batch_args))
+
+    # Legacy tools: allow baseUrl/insecure
+    client = _client(session=session, base_url=args.get("baseUrl"), insecure=insecure)
 
     if name == "oa_auth_status":
         client.assert_logged_in()

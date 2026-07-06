@@ -821,6 +821,38 @@ class OAClient:
         if fd_id not in todo_ids:
             raise PermissionGateError(f"拒绝操作：{fd_id} 不在当前登录账号的待审批列表中")
 
+    def _request_bytes(
+        self,
+        path: str,
+        method: str = "GET",
+        params: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """返回原始 bytes，不做 decode；用于二进制附件下载。"""
+        url = urllib.parse.urljoin(self.base_url, path.lstrip("/"))
+        if params:
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method=method,
+            headers={
+                "User-Agent": "oa-agent-connector/0.1",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "application/json,text/json,text/html,*/*",
+            },
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout) as resp:
+                raw = resp.read()
+                return {"url": resp.geturl(), "bytes": raw}
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise OAConnectorError(f"HTTP {exc.code}: {raw[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise OAConnectorError(f"请求 OA 失败: {exc}") from exc
+
     def _request(
         self,
         path: str,
@@ -987,6 +1019,13 @@ class OAClient:
         if max_downloads < 0 or max_downloads > SEARCH_LIMITS["batchMaxDownloadsMax"]:
             raise OAConnectorError("maxDownloads 超过允许范围")
 
+        # 显式校验批量模式下的 pageSize
+        raw_page_size = kwargs.get("pageSize")
+        if raw_page_size is not None:
+            ps = int(raw_page_size)
+            if ps < 1 or ps > SEARCH_LIMITS["batchPageSizeMax"]:
+                raise OAConnectorError("pageSize 超过允许范围")
+
         items: List[Dict[str, Any]] = []
         matched_queries = 0
         errors = 0
@@ -1094,11 +1133,14 @@ class OAClient:
         filename = self._safe_filename(str(selected.get("name") or "attachment"))
         output_path = self._unique_output_path(Path(output_dir), filename, overwrite)
         download_path = self._attachment_download_path(detail["recordRef"], selected)
-        response = self._request(download_path)
-        text = response["text"]
-        if self._looks_like_login_page(response["url"], text) or "<html" in text[:512].lower():
+        response = self._request_bytes(download_path)
+        raw = response["bytes"]
+        # 登录页/HTML 检测：检查前 512 字节
+        head = raw[:512]
+        if self._looks_like_login_page(response["url"], head.decode("utf-8", errors="replace")):
             raise OAConnectorError("下载附件失败，当前会话可能失效或无权限")
-        raw = text.encode("utf-8")
+        if b"<html" in head.lower():
+            raise OAConnectorError("下载附件失败，当前会话可能失效或无权限")
         if len(raw) > max_bytes:
             raise OAConnectorError("附件超过下载大小上限")
 

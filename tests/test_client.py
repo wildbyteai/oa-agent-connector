@@ -337,17 +337,25 @@ class ObjectDetailTest(unittest.TestCase):
 
 
 class FakeDownloadClient(OAClient):
-    def __init__(self, detail_html, download_text):
+    def __init__(self, detail_html, download_bytes):
         super().__init__("https://oa.example.test/")
         self.detail_html = detail_html
-        self.download_text = download_text
+        # download_bytes 可以是 str（向后兼容）或 bytes
+        if isinstance(download_bytes, bytes):
+            self.download_bytes = download_bytes
+        else:
+            self.download_bytes = download_bytes.encode("utf-8")
         self.requests = []
 
     def _request(self, path, method="GET", params=None, data=None):
         self.requests.append({"path": path, "method": method, "params": params or {}, "data": data})
-        if "sys_att_main" in path:
-            return {"url": "https://oa.example.test/sys/attachment/sys_att_main/sysAttMain.do", "text": self.download_text}
         return {"url": "https://oa.example.test/detail", "text": self.detail_html}
+
+    def _request_bytes(self, path, method="GET", params=None, data=None):
+        self.requests.append({"path": path, "method": method, "params": params or {}, "data": data})
+        if "sys_att_main" in path:
+            return {"url": "https://oa.example.test/sys/attachment/sys_att_main/sysAttMain.do", "bytes": self.download_bytes}
+        return {"url": "https://oa.example.test/detail", "bytes": self.detail_html.encode("utf-8")}
 
 
 class AttachmentDownloadTest(unittest.TestCase):
@@ -392,13 +400,56 @@ class AttachmentDownloadTest(unittest.TestCase):
             "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
         }
         with tempfile.TemporaryDirectory() as tmpdir:
-            html_client = FakeDownloadClient(detail_html, "<html>login</html>")
+            html_client = FakeDownloadClient(detail_html, b"<html>login</html>")
             with self.assertRaises(OAConnectorError):
                 html_client.download_attachment(ref, 1, tmpdir, max_bytes=1000)
 
-            large_client = FakeDownloadClient(detail_html, "x" * 11)
+            large_client = FakeDownloadClient(detail_html, b"x" * 11)
             with self.assertRaises(OAConnectorError):
                 large_client.download_attachment(ref, 1, tmpdir, max_bytes=10)
+
+    def test_download_binary_bytes_preserved_exactly(self):
+        """验证二进制附件（含非 UTF-8 字节）下载后文件内容完全一致。"""
+        detail_html = """
+        <script>attachmentObject_attachment.addDoc('att-1','file-1','report.bin','application/octet-stream','8');</script>
+        """
+        # 构造含非 UTF-8 字节的二进制数据
+        binary_data = bytes(range(256))[:64]  # 0x00..0x3F，包含 0x00 等控制字符
+        ref = {
+            "scope": "knowledge",
+            "modelName": "KmsMultidocKnowledge",
+            "recordId": "18256d188087f3669a0808d440da67a6",
+            "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeDownloadClient(detail_html, binary_data)
+            result = client.download_attachment(ref, 1, tmpdir, max_bytes=1024)
+            saved = Path(result["savedPath"])
+            self.assertTrue(saved.exists())
+            self.assertEqual(saved.read_bytes(), binary_data)
+            self.assertEqual(result["bytes"], len(binary_data))
+
+    def test_download_pdf_bytes_preserved(self):
+        """验证模拟 PDF 二进制数据下载后完全一致。"""
+        detail_html = """
+        <script>attachmentObject_attachment.addDoc('att-1','file-1','doc.pdf','application/pdf','8');</script>
+        """
+        # PDF 魔数 + 非 UTF-8 数据
+        pdf_header = b"%PDF-1.4\n"
+        pdf_body = b"\x80\x81\x82\x83\xff\xfe\xfd"
+        pdf_data = pdf_header + pdf_body
+        ref = {
+            "scope": "knowledge",
+            "modelName": "KmsMultidocKnowledge",
+            "recordId": "18256d188087f3669a0808d440da67a6",
+            "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeDownloadClient(detail_html, pdf_data)
+            result = client.download_attachment(ref, 1, tmpdir, max_bytes=1024)
+            saved = Path(result["savedPath"])
+            self.assertEqual(saved.read_bytes(), pdf_data)
+            self.assertEqual(result["bytes"], len(pdf_data))
 
 
 class FakeBatchClient(FakeSearchClient):
@@ -483,6 +534,16 @@ class BatchSearchObjectsTest(unittest.TestCase):
             )
             self.assertEqual(result["summary"]["downloads"], 1)
             self.assertEqual(len(client.downloads), 1)
+
+    def test_batch_search_rejects_page_size_above_20(self):
+        """batch=True 时 pageSize=21 应被拒绝（batchPageSizeMax=20）。"""
+        client = FakeBatchClient()
+        with self.assertRaises(OAConnectorError) as ctx:
+            client.batch_search_objects(
+                queries=["test"],
+                pageSize=21,
+            )
+        self.assertIn("pageSize", str(ctx.exception))
 
 
 if __name__ == "__main__":
