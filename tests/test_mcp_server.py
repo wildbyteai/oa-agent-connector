@@ -220,5 +220,69 @@ class MCPServerTest(unittest.TestCase):
                     self.assertIn("requiredFlow", payload)
 
 
+class SearchMCPServerTest(unittest.TestCase):
+    def test_search_tools_are_listed_with_strict_schema(self):
+        tools = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})["result"]["tools"]
+        by_name = {tool["name"]: tool for tool in tools}
+        for name in [
+            "oa_get_search_schema",
+            "oa_search_objects",
+            "oa_get_object_detail",
+            "oa_download_attachment",
+            "oa_batch_search_objects",
+        ]:
+            self.assertIn(name, by_name)
+            self.assertFalse(by_name[name]["inputSchema"].get("additionalProperties", True))
+
+        search_props = by_name["oa_search_objects"]["inputSchema"]["properties"]
+        self.assertIn("query", search_props)
+        self.assertNotIn("baseUrl", search_props)
+        self.assertNotIn("insecure", search_props)
+
+    def test_search_tool_calls_delegate_to_client(self):
+        class SearchFakeClient(FakeClient):
+            def get_search_schema(self, scope="all"):
+                return {"scope": scope, "models": [], "searchFields": ["title"], "limits": {}}
+
+            def search_objects(self, **kwargs):
+                return {"query": kwargs["query"], "items": [], "page": 1, "pageSize": 20, "total": 0}
+
+            def get_object_detail(self, record_ref=None, include_text=True, text_limit=12000, fields=None, fd_id=None):
+                return {"recordRef": record_ref, "title": "详情", "text": "", "attachments": []}
+
+            def download_attachment(self, record_ref, attachment_index, output_dir, overwrite=False, max_bytes=52428800, fd_id=None):
+                return {"ok": True, "savedPath": str(Path(output_dir) / "a.pdf"), "bytes": 1}
+
+            def batch_search_objects(self, queries, **kwargs):
+                return {"items": [], "summary": {"totalQueries": len(queries), "matchedQueries": 0, "errors": 0, "downloads": 0}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", SearchFakeClient):
+                    schema = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_get_search_schema", "arguments": {"scope": "knowledge"}},
+                    })
+                    self.assertEqual(json.loads(schema["result"]["content"][0]["text"])["scope"], "knowledge")
+
+                    searched = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "oa_search_objects", "arguments": {"query": "abc", "scope": "knowledge"}},
+                    })
+                    self.assertEqual(json.loads(searched["result"]["content"][0]["text"])["query"], "abc")
+
+                    batched = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": "oa_batch_search_objects", "arguments": {"queries": ["a", "b"], "scope": "knowledge"}},
+                    })
+                    self.assertEqual(json.loads(batched["result"]["content"][0]["text"])["summary"]["totalQueries"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -325,6 +325,93 @@ TOOLS = [
         },
         ["fdId", "note"],
     ),
+    _tool_schema(
+        "oa_get_search_schema",
+        "返回当前 MCP 支持的 OA 搜索范围、字段枚举、排序、文件类型和限制规则。",
+        {
+            "scope": {"type": "string", "description": "搜索范围，默认 all，可选 knowledge"},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+        },
+    ),
+    _tool_schema(
+        "oa_search_objects",
+        "执行 OA 通用只读搜索，返回结构化结果和受控 recordRef。",
+        {
+            "query": {"type": "string"},
+            "scope": {"type": "string"},
+            "modelName": {"type": "string"},
+            "bond": {"type": "string", "enum": ["or", "and", "like"]},
+            "searchFields": {"type": "array", "items": {"type": "string"}},
+            "category": {"type": "string"},
+            "docStatus": {"type": "string"},
+            "docFileType": {"type": "string"},
+            "outKeyword": {"type": "string"},
+            "timeRange": {"type": "string"},
+            "fromCreateTime": {"type": "string"},
+            "toCreateTime": {"type": "string"},
+            "sortType": {"type": "string"},
+            "sortOrder": {"type": "string"},
+            "exactTitle": {"type": "boolean"},
+            "onlyExactTitle": {"type": "boolean"},
+            "page": {"type": "integer", "minimum": 1},
+            "pageSize": {"type": "integer", "minimum": 1, "maximum": 50},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+        },
+        ["query"],
+    ),
+    _tool_schema(
+        "oa_get_object_detail",
+        "按搜索结果返回的 recordRef 读取 OA 对象详情和附件元数据。",
+        {
+            "recordRef": {"type": "object"},
+            "fdId": {"type": "string", "description": "兼容便捷参数，仅默认知识文档解析器使用"},
+            "includeText": {"type": "boolean"},
+            "textLimit": {"type": "integer", "minimum": 0, "maximum": 20000},
+            "fields": {"type": "array", "items": {"type": "string"}},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+        },
+    ),
+    _tool_schema(
+        "oa_download_attachment",
+        "按 recordRef + attachmentIndex 下载当前详情页中可见附件到本地安全目录。",
+        {
+            "recordRef": {"type": "object"},
+            "fdId": {"type": "string", "description": "兼容便捷参数，仅默认知识文档解析器使用"},
+            "attachmentIndex": {"type": "integer", "minimum": 1},
+            "outputDir": {"type": "string"},
+            "overwrite": {"type": "boolean"},
+            "maxBytes": {"type": "integer", "minimum": 1, "maximum": 52428800},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+        },
+        ["attachmentIndex", "outputDir"],
+    ),
+    _tool_schema(
+        "oa_batch_search_objects",
+        "批量执行通用 OA 搜索，输入为 queries 数组，可选列附件或受限下载。",
+        {
+            "queries": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
+            "scope": {"type": "string"},
+            "modelName": {"type": "string"},
+            "bond": {"type": "string", "enum": ["or", "and", "like"]},
+            "searchFields": {"type": "array", "items": {"type": "string"}},
+            "sortType": {"type": "string"},
+            "sortOrder": {"type": "string"},
+            "docFileType": {"type": "string"},
+            "exactTitle": {"type": "boolean"},
+            "onlyExactTitle": {"type": "boolean"},
+            "pageSize": {"type": "integer", "minimum": 1, "maximum": 20},
+            "includeDetails": {"type": "boolean"},
+            "includeAttachments": {"type": "boolean"},
+            "maxDetailsPerQuery": {"type": "integer", "minimum": 1, "maximum": 3},
+            "downloadFirstAttachment": {"type": "boolean"},
+            "maxDownloads": {"type": "integer", "minimum": 0, "maximum": 50},
+            "outputDir": {"type": "string"},
+            "overwrite": {"type": "boolean"},
+            "maxBytes": {"type": "integer", "minimum": 1, "maximum": 52428800},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+        },
+        ["queries"],
+    ),
 ]
 
 
@@ -377,6 +464,58 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         return _ok({"ok": True, "executed": True, "action": pending["action"], "fdId": pending["fdId"], "result": result})
 
     client = _client(session=session, base_url=args.get("baseUrl"), insecure=insecure)
+
+    if name == "oa_get_search_schema":
+        return _ok(client.get_search_schema(str(args.get("scope") or "all")))
+    if name == "oa_search_objects":
+        return _ok(
+            client.search_objects(
+                query=str(args["query"]),
+                scope=args.get("scope") or "all",
+                modelName=args.get("modelName"),
+                bond=args.get("bond") or "or",
+                searchFields=args.get("searchFields") or [],
+                category=args.get("category") or "",
+                docStatus=args.get("docStatus") or "",
+                docFileType=args.get("docFileType") or "",
+                outKeyword=args.get("outKeyword") or "",
+                timeRange=args.get("timeRange") or "",
+                fromCreateTime=args.get("fromCreateTime") or "",
+                toCreateTime=args.get("toCreateTime") or "",
+                sortType=args.get("sortType") or "relevance",
+                sortOrder=args.get("sortOrder") or "desc",
+                exactTitle=_bool(args, "exactTitle"),
+                onlyExactTitle=_bool(args, "onlyExactTitle"),
+                page=int(args.get("page") or 1),
+                pageSize=int(args.get("pageSize") or 20),
+            )
+        )
+    if name == "oa_get_object_detail":
+        return _ok(
+            client.get_object_detail(
+                record_ref=args.get("recordRef"),
+                include_text=_bool(args, "includeText", True),
+                text_limit=int(args.get("textLimit") or 12000),
+                fields=args.get("fields") or [],
+                fd_id=args.get("fdId"),
+            )
+        )
+    if name == "oa_download_attachment":
+        return _ok(
+            client.download_attachment(
+                record_ref=args.get("recordRef"),
+                attachment_index=int(args["attachmentIndex"]),
+                output_dir=str(args["outputDir"]),
+                overwrite=_bool(args, "overwrite"),
+                max_bytes=int(args.get("maxBytes") or 52428800),
+                fd_id=args.get("fdId"),
+            )
+        )
+    if name == "oa_batch_search_objects":
+        batch_args = dict(args)
+        queries = list(batch_args.pop("queries"))
+        batch_args.pop("session", None)
+        return _ok(client.batch_search_objects(queries=queries, **batch_args))
 
     if name == "oa_auth_status":
         client.assert_logged_in()
