@@ -305,6 +305,132 @@ class OAClient:
             raise OAConnectorError("当前会话未登录，不能查询待办")
         return self._parse_todos(response["text"])
 
+    def search_objects(self, **kwargs: Any) -> Dict[str, Any]:
+        validated = self._validate_search_params(kwargs)
+        params: Dict[str, str] = {
+            "method": "search",
+            "resultType": "json",
+            "newLUI": "true",
+            "searchAll": "true",
+            "queryString": validated["query"],
+            "pageno": str(validated["page"]),
+            "rowsize": str(validated["pageSize"]),
+            "bond": validated["bond"],
+        }
+        if validated["outKeyword"]:
+            params["outKeyword"] = validated["outKeyword"]
+        if validated["searchFields"]:
+            params["searchFields"] = ",".join(validated["searchFields"])
+        if validated["docFileType"]:
+            params["docFileType"] = validated["docFileType"]
+        if validated["timeRange"]:
+            params["timeRange"] = validated["timeRange"]
+        if validated["fromCreateTime"]:
+            params["fromCreateTime"] = validated["fromCreateTime"]
+        if validated["toCreateTime"]:
+            params["toCreateTime"] = validated["toCreateTime"]
+        if validated["category"]:
+            params["category"] = validated["category"]
+        if validated["docStatus"]:
+            params["docStatus"] = validated["docStatus"]
+        if validated["modelName"]:
+            params["modelName"] = validated["modelName"]
+        if validated["sortType"] != "relevance":
+            params["sortType"] = validated["sortType"]
+        if validated["sortType"] == "time":
+            params["sortOrder"] = validated["sortOrder"]
+
+        response = self._request("sys/ftsearch/searchBuilder.do", params=params)
+        if self._looks_like_login_page(response["url"], response["text"]):
+            raise OAConnectorError("当前会话未登录，不能搜索 OA 内容")
+        parsed = self._try_json(response["text"].lstrip("﻿\r\n\t "))
+        if parsed is None:
+            raise OAConnectorError("搜索出现错误：OA 返回非 JSON 响应")
+        return self._parse_search_results(parsed, validated)
+
+    def _parse_search_results(self, payload: Any, validated: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(payload, dict) and payload.get("EsError"):
+            raise OAConnectorError(f"搜索出现错误：{str(payload.get('EsError'))[:120]}")
+        query_page = payload.get("queryPage", payload) if isinstance(payload, dict) else {}
+        rows = []
+        if isinstance(query_page, dict):
+            rows = query_page.get("list") or query_page.get("rows") or query_page.get("data") or []
+        if not isinstance(rows, list):
+            rows = []
+
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            record_ref = self._record_ref_from_search_row(row, validated["scope"])
+            if not record_ref:
+                continue
+            fields = row.get("lksFieldsMap") if isinstance(row.get("lksFieldsMap"), dict) else {}
+            title = self._clean_search_title(
+                fields.get("subject") or row.get("subject") or row.get("docSubject") or row.get("title") or ""
+            )
+            matched_exact = title == validated["query"] if validated["exactTitle"] else False
+            if validated["onlyExactTitle"] and not matched_exact:
+                continue
+            model_name = str(record_ref.get("modelName") or row.get("modelName") or "")
+            supports_detail, supports_attachments = self._model_capabilities(validated["scope"], model_name)
+            summary = self._strip_html(str(row.get("content") or row.get("fdDescription") or ""))[:300]
+            read_count = self._to_int(row.get("docReadCount") or row.get("readCount"))
+            items.append(
+                {
+                    "recordRef": record_ref,
+                    "fdId": record_ref["recordId"],
+                    "title": title,
+                    "summary": summary,
+                    "creator": self._strip_html(str(row.get("creator") or "")),
+                    "createTime": str(row.get("createTime") or ""),
+                    "readCount": read_count,
+                    "modelTitle": str(row.get("modelTitle") or ""),
+                    "matchedExactTitle": matched_exact,
+                    "supportsDetail": supports_detail,
+                    "supportsAttachments": supports_attachments,
+                }
+            )
+        total = self._to_int(query_page.get("totalrows") if isinstance(query_page, dict) else None)
+        return {
+            "query": validated["query"],
+            "items": items,
+            "page": validated["page"],
+            "pageSize": validated["pageSize"],
+            "total": total if total is not None else len(items),
+            "totalNote": "以 OA 搜索接口返回为准",
+        }
+
+    def _record_ref_from_search_row(self, row: Dict[str, Any], scope: str) -> Optional[Dict[str, str]]:
+        model_name = str(row.get("modelName") or "")
+        path = str(row.get("linkStr") or "")
+        if not path.startswith("/") or path.startswith("//") or ".." in path.split("?")[0].split("/"):
+            return None
+        record_id = str(row.get("docKey") or "").strip()
+        if not record_id:
+            match = re.search(r"(?:fdId=|fdId/)([0-9a-fA-F]{24,40})", path)
+            record_id = match.group(1) if match else ""
+        if not record_id:
+            return None
+        return {"scope": scope, "modelName": model_name, "recordId": record_id, "path": path}
+
+    def _model_capabilities(self, scope: str, model_name: str) -> tuple[bool, bool]:
+        config = self._scope_config(scope)
+        if config.get("detailParser") == "kms_multidoc_knowledge":
+            allowed = config.get("allowedModelNames", [])
+            if model_name in allowed or model_name.endswith("KmsMultidocKnowledge"):
+                return True, True
+        return False, False
+
+    def _clean_search_title(self, value: Any) -> str:
+        return self._strip_html(str(value or ""))
+
+    def _to_int(self, value: Any) -> Optional[int]:
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+
     def get_detail(self, fd_id: str, require_in_todo: bool = True) -> Dict[str, Any]:
         if require_in_todo:
             self._assert_fd_id_in_current_todos(fd_id)

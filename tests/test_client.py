@@ -203,5 +203,74 @@ class SearchValidationTest(unittest.TestCase):
         self.assertIn("搜索关键词不合法", str(ctx.exception))
 
 
+class FakeSearchClient(OAClient):
+    def __init__(self, payload):
+        super().__init__("https://oa.example.test/")
+        self.payload = payload
+        self.last_request = None
+
+    def _request(self, path, method="GET", params=None, data=None):
+        self.last_request = {"path": path, "method": method, "params": params or {}, "data": data}
+        return {"url": "https://oa.example.test/search", "text": json.dumps(self.payload, ensure_ascii=False)}
+
+
+class SearchObjectsTest(unittest.TestCase):
+    def test_search_objects_parses_record_ref_and_exact_title(self):
+        payload = {
+            "queryPage": {
+                "totalrows": 2,
+                "list": [
+                    {
+                        "lksFieldsMap": {"subject": "<em>出厂报告-产品A</em>"},
+                        "content": "摘要内容",
+                        "creator": "张三",
+                        "createTime": "2026-07-01",
+                        "docReadCount": "4",
+                        "modelName": "com.landray.kmss.kms.multidoc.model.KmsMultidocKnowledge",
+                        "modelTitle": "文档知识库",
+                        "linkStr": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+                    },
+                    {
+                        "lksFieldsMap": {"subject": "出厂报告-产品B"},
+                        "content": "另一个摘要",
+                        "modelName": "KmsMultidocKnowledge",
+                        "linkStr": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=28256d188087f3669a0808d440da67a6",
+                    },
+                ],
+            }
+        }
+        client = FakeSearchClient(payload)
+
+        result = client.search_objects(
+            query="出厂报告-产品A",
+            scope="knowledge",
+            modelName="KmsMultidocKnowledge",
+            bond="like",
+            searchFields=["title", "attachment"],
+            docFileType="pdf",
+            sortType="time",
+            sortOrder="desc",
+            exactTitle=True,
+            onlyExactTitle=True,
+        )
+
+        self.assertEqual(result["query"], "出厂报告-产品A")
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(len(result["items"]), 1)
+        item = result["items"][0]
+        self.assertEqual(item["fdId"], "18256d188087f3669a0808d440da67a6")
+        self.assertEqual(item["title"], "出厂报告-产品A")
+        self.assertTrue(item["matchedExactTitle"])
+        self.assertTrue(item["supportsDetail"])
+        self.assertTrue(item["supportsAttachments"])
+        self.assertEqual(item["recordRef"]["path"], "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6")
+        self.assertEqual(client.last_request["params"]["resultType"], "json")
+        self.assertEqual(client.last_request["params"]["bond"], "like")
+        self.assertEqual(client.last_request["params"]["docFileType"], "pdf")
+        self.assertEqual(client.last_request["params"]["sortType"], "time")
+        self.assertEqual(client.last_request["params"]["sortOrder"], "desc")
+        self.assertEqual(client.last_request["params"]["searchFields"], "subject,attachment")
+
+
 if __name__ == "__main__":
     unittest.main()
