@@ -139,8 +139,24 @@ def _setup_guide(reason: str = "") -> Dict[str, Any]:
     }
 
 
+def _redact_tool_message(message: str) -> str:
+    text = str(message or "")
+    # Split on semicolons to handle multi-value headers like "Cookie: a=1; b=2"
+    parts = re.split(r";", text)
+    for i, part in enumerate(parts):
+        part = re.sub(
+            r"(?i)(cookie|set-cookie|jsessionid|authorization|password|j_password)\s*[:=]\s*\S.*",
+            r"\1=[redacted]",
+            part,
+        )
+        parts[i] = part
+    text = ";".join(parts)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:200]
+
+
 def _tool_error(message: str) -> Dict[str, Any]:
-    return _mcp_error(_setup_guide(message))
+    return _mcp_error(_setup_guide(_redact_tool_message(message)))
 
 
 def _plain_text(value: Any) -> str:

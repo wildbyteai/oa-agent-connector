@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -282,6 +283,48 @@ class SearchMCPServerTest(unittest.TestCase):
                         "params": {"name": "oa_batch_search_objects", "arguments": {"queries": ["a", "b"], "scope": "knowledge"}},
                     })
                     self.assertEqual(json.loads(batched["result"]["content"][0]["text"])["summary"]["totalQueries"], 2)
+
+
+class SensitiveOutputRegressionTest(unittest.TestCase):
+    def test_new_tool_error_output_does_not_leak_sensitive_patterns(self):
+        class LeakyClient(FakeClient):
+            def search_objects(self, **kwargs):
+                raise RuntimeError("Cookie: abc; Set-Cookie: def; JSESSIONID=ghi; Authorization: Bearer token; <html>full</html>")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", LeakyClient):
+                    response = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_search_objects", "arguments": {"query": "abc"}},
+                    })
+        text = response["result"]["content"][0]["text"]
+        # Verify sensitive patterns are not leaked as standalone tokens
+        for forbidden in ["abc", "ghi", "Bearer token", "<html>"]:
+            self.assertNotRegex(text, rf"\b{re.escape(forbidden)}\b")
+        # "def" is a common substring in words like "description"; check the
+        # redacted reason field directly instead of a whole-text substring match.
+        payload = json.loads(text)
+        self.assertNotRegex(payload["reason"], r"Set-Cookie:\s*\S+")
+
+    def test_existing_direct_execute_is_still_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", FakeClient):
+                    response = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "oa_reject",
+                            "arguments": {"fdId": "1234567890abcdef1234567890abcdef", "note": "不同意", "execute": True},
+                        },
+                    })
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["requiredFlow"], ["oa_prepare_approval", "用户确认审批信息", "oa_confirm_approval"])
 
 
 if __name__ == "__main__":
