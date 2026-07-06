@@ -19,6 +19,71 @@ FD_ID_RE = re.compile(r"\bfdId[=/]([0-9a-fA-F]{24,40})")
 FD_ID_VALUE_RE = re.compile(r"""(?:["']?fdId["']?\s*[:=]\s*["']|value=["'])([0-9a-fA-F]{24,40})""")
 SUBJECT_RE = re.compile(r"""class=["'][^"']*com_subject[^"']*["'][^>]*>(.*?)</""", re.I | re.S)
 
+SEARCH_LIMITS = {
+    "queryMaxLength": 200,
+    "pageSizeDefault": 20,
+    "pageSizeMax": 50,
+    "batchQueriesMax": 100,
+    "batchPageSizeDefault": 5,
+    "batchPageSizeMax": 20,
+    "maxDetailsPerQueryDefault": 1,
+    "maxDetailsPerQueryMax": 3,
+    "detailTextLimitDefault": 12000,
+    "detailTextLimitMax": 20000,
+    "downloadMaxBytesDefault": 52428800,
+    "batchMaxDownloadsDefault": 0,
+    "batchMaxDownloadsMax": 50,
+}
+
+SEARCH_FIELD_MAP = {
+    "title": "subject",
+    "content": "content",
+    "fdDescription": "fdDescription",
+    "creator": "creator",
+    "attachment": "attachment",
+}
+
+SEARCH_SCOPES = {
+    "all": {
+        "description": "OA 全系统搜索，默认只返回搜索结果元数据，不进入未知模块详情解析",
+        "allowedModelNames": ["*"],
+        "models": [
+            {"modelName": "*", "title": "全部", "supportsDetail": False, "supportsAttachments": False},
+        ],
+    },
+    "knowledge": {
+        "description": "文档知识库",
+        "allowedModelNames": [
+            "KmsMultidocKnowledge",
+            "com.landray.kmss.kms.multidoc.model.KmsMultidocKnowledge",
+        ],
+        "detailParser": "kms_multidoc_knowledge",
+        "models": [
+            {
+                "modelName": "KmsMultidocKnowledge",
+                "title": "文档知识库",
+                "supportsDetail": True,
+                "supportsAttachments": True,
+            },
+        ],
+    },
+    "news": {
+        "description": "新闻文档",
+        "allowedModelNames": ["SysNewsMain", "com.landray.kmss.sys.news.model.SysNewsMain"],
+        "models": [
+            {"modelName": "SysNewsMain", "title": "新闻文档", "supportsDetail": False, "supportsAttachments": False},
+        ],
+    },
+}
+
+ALLOWED_BONDS = ("or", "and", "like")
+ALLOWED_SORT_TYPES = ("relevance", "readCount", "time")
+ALLOWED_SORT_ORDERS = ("asc", "desc")
+ALLOWED_TIME_RANGES = ("", "day", "week", "month", "year")
+ALLOWED_DOC_FILE_TYPES = ("", "pdf", "doc;docx", "xls;xlsx", "ppt;pptx", "txt")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
 
 class OAConnectorError(RuntimeError):
     pass
@@ -94,6 +159,112 @@ class OAClient:
         if not verify_tls:
             handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
         self.opener = urllib.request.build_opener(*handlers)
+
+    def get_search_schema(self, scope: str = "all") -> Dict[str, Any]:
+        scope = scope or "all"
+        config = self._scope_config(scope)
+        return {
+            "scope": scope,
+            "models": list(config.get("models", [])),
+            "searchFields": list(SEARCH_FIELD_MAP.keys()),
+            "bond": list(ALLOWED_BONDS),
+            "sortTypes": list(ALLOWED_SORT_TYPES),
+            "sortOrders": list(ALLOWED_SORT_ORDERS),
+            "timeRanges": [value for value in ALLOWED_TIME_RANGES if value],
+            "docFileTypes": [value for value in ALLOWED_DOC_FILE_TYPES if value],
+            "limits": dict(SEARCH_LIMITS),
+        }
+
+    def _scope_config(self, scope: str) -> Dict[str, Any]:
+        if scope not in SEARCH_SCOPES:
+            raise OAConnectorError("不支持的搜索范围或模块")
+        return SEARCH_SCOPES[scope]
+
+    def _normalize_model_name(self, scope: str, model_name: Optional[str]) -> Optional[str]:
+        if not model_name:
+            return None
+        allowed = self._scope_config(scope).get("allowedModelNames", [])
+        if "*" not in allowed and model_name not in allowed:
+            raise OAConnectorError("不支持的搜索范围或模块")
+        return str(model_name)
+
+    def _validate_search_params(self, params: Dict[str, Any], *, batch: bool = False) -> Dict[str, Any]:
+        query = str(params.get("query") or "").strip()
+        if not query:
+            raise OAConnectorError("搜索关键词不能为空")
+        if len(query) > SEARCH_LIMITS["queryMaxLength"] or CONTROL_CHAR_RE.search(query):
+            raise OAConnectorError("搜索关键词不合法")
+
+        scope = str(params.get("scope") or "all")
+        self._scope_config(scope)
+        model_name = self._normalize_model_name(scope, params.get("modelName"))
+
+        bond = str(params.get("bond") or "or")
+        if bond not in ALLOWED_BONDS:
+            raise OAConnectorError("不支持的关键词关系")
+
+        raw_fields = params.get("searchFields") or []
+        if isinstance(raw_fields, str):
+            raw_fields = [raw_fields]
+        search_fields: List[str] = []
+        for field in raw_fields:
+            field = str(field)
+            if field not in SEARCH_FIELD_MAP:
+                raise OAConnectorError("不支持的搜索字段")
+            search_fields.append(SEARCH_FIELD_MAP[field])
+
+        doc_file_type = str(params.get("docFileType") or "")
+        if doc_file_type not in ALLOWED_DOC_FILE_TYPES:
+            raise OAConnectorError("不支持的附件类型")
+
+        sort_type = str(params.get("sortType") or "relevance")
+        if sort_type not in ALLOWED_SORT_TYPES:
+            raise OAConnectorError("不支持的排序字段")
+        sort_order = str(params.get("sortOrder") or "desc")
+        if sort_order not in ALLOWED_SORT_ORDERS:
+            raise OAConnectorError("不支持的排序方向")
+
+        time_range = str(params.get("timeRange") or "")
+        if time_range not in ALLOWED_TIME_RANGES:
+            raise OAConnectorError("不支持的时间范围")
+
+        from_create_time = str(params.get("fromCreateTime") or "")
+        to_create_time = str(params.get("toCreateTime") or "")
+        for value in (from_create_time, to_create_time):
+            if value and not DATE_RE.match(value):
+                raise OAConnectorError("日期格式必须为 YYYY-MM-DD")
+        if from_create_time and to_create_time and from_create_time > to_create_time:
+            raise OAConnectorError("开始日期不得晚于结束日期")
+
+        default_page_size = SEARCH_LIMITS["batchPageSizeDefault"] if batch else SEARCH_LIMITS["pageSizeDefault"]
+        max_page_size = SEARCH_LIMITS["batchPageSizeMax"] if batch else SEARCH_LIMITS["pageSizeMax"]
+        page = int(params.get("page") or 1)
+        page_size = int(params.get("pageSize") or default_page_size)
+        if page < 1:
+            raise OAConnectorError("页码必须大于 0")
+        if page_size < 1 or page_size > max_page_size:
+            raise OAConnectorError("pageSize 超过允许范围")
+
+        return {
+            "query": query,
+            "scope": scope,
+            "modelName": model_name,
+            "bond": bond,
+            "outKeyword": str(params.get("outKeyword") or ""),
+            "searchFields": search_fields,
+            "docFileType": doc_file_type,
+            "timeRange": time_range,
+            "fromCreateTime": from_create_time,
+            "toCreateTime": to_create_time,
+            "category": str(params.get("category") or ""),
+            "docStatus": str(params.get("docStatus") or ""),
+            "sortType": sort_type,
+            "sortOrder": sort_order,
+            "exactTitle": bool(params.get("exactTitle", False)),
+            "onlyExactTitle": bool(params.get("onlyExactTitle", False)),
+            "page": page,
+            "pageSize": page_size,
+        }
 
     def login(self, username: str, password: str) -> bool:
         response = self._request(

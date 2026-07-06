@@ -105,5 +105,73 @@ class OAClientTest(unittest.TestCase):
         self.assertEqual(task, {"id": "refuse-task", "type": "reviewWorkitem"})
 
 
+class SearchSchemaTest(unittest.TestCase):
+    def test_get_search_schema_for_knowledge(self):
+        client = FakeOAClient("{}")
+        schema = client.get_search_schema("knowledge")
+
+        self.assertEqual(schema["scope"], "knowledge")
+        self.assertIn("KmsMultidocKnowledge", [m["modelName"] for m in schema["models"]])
+        self.assertIn("title", schema["searchFields"])
+        self.assertIn("attachment", schema["searchFields"])
+        self.assertEqual(schema["limits"]["queryMaxLength"], 200)
+        self.assertEqual(schema["limits"]["pageSizeMax"], 50)
+        self.assertEqual(schema["limits"]["batchQueriesMax"], 100)
+        self.assertEqual(schema["limits"]["detailTextLimitMax"], 20000)
+        self.assertEqual(schema["limits"]["downloadMaxBytesDefault"], 52428800)
+
+    def test_get_search_schema_rejects_unknown_scope(self):
+        client = FakeOAClient("{}")
+        with self.assertRaises(OAConnectorError) as ctx:
+            client.get_search_schema("finance-secret")
+        self.assertIn("不支持的搜索范围或模块", str(ctx.exception))
+
+
+class SearchValidationTest(unittest.TestCase):
+    def test_validate_search_params_maps_and_defaults(self):
+        client = FakeOAClient("{}")
+        params = client._validate_search_params({
+            "query": "出厂报告-产品A",
+            "scope": "knowledge",
+            "modelName": "KmsMultidocKnowledge",
+            "bond": "like",
+            "searchFields": ["title", "attachment"],
+            "docFileType": "pdf",
+            "sortType": "time",
+            "sortOrder": "desc",
+            "page": 1,
+            "pageSize": 20,
+        })
+
+        self.assertEqual(params["query"], "出厂报告-产品A")
+        self.assertEqual(params["scope"], "knowledge")
+        self.assertEqual(params["modelName"], "KmsMultidocKnowledge")
+        self.assertEqual(params["searchFields"], ["subject", "attachment"])
+        self.assertEqual(params["pageSize"], 20)
+
+    def test_validate_search_params_rejects_bad_values(self):
+        client = FakeOAClient("{}")
+        bad_cases = [
+            {"query": ""},
+            {"query": "x" * 201},
+            {"query": "abc\x00def"},
+            {"query": "x", "scope": "unknown"},
+            {"query": "x", "scope": "knowledge", "modelName": "BadModel"},
+            {"query": "x", "bond": "near"},
+            {"query": "x", "searchFields": ["rawSql"]},
+            {"query": "x", "docFileType": "exe"},
+            {"query": "x", "sortType": "fd_secret"},
+            {"query": "x", "sortOrder": "sideways"},
+            {"query": "x", "timeRange": "decade"},
+            {"query": "x", "fromCreateTime": "2026/07/06"},
+            {"query": "x", "fromCreateTime": "2026-07-07", "toCreateTime": "2026-07-06"},
+            {"query": "x", "pageSize": 51},
+        ]
+        for case in bad_cases:
+            with self.subTest(case=case):
+                with self.assertRaises(OAConnectorError):
+                    client._validate_search_params(case)
+
+
 if __name__ == "__main__":
     unittest.main()
