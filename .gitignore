@@ -18,3 +18,5 @@ venv/
 /.oa-session.cookies
 /.claude/
 /.obsidian/
+
+.superpowers/
