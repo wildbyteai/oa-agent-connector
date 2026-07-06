@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -218,6 +219,163 @@ class MCPServerTest(unittest.TestCase):
                     self.assertTrue(response["result"]["isError"])
                     payload = json.loads(response["result"]["content"][0]["text"])
                     self.assertIn("requiredFlow", payload)
+
+
+class SearchMCPServerTest(unittest.TestCase):
+    def test_search_tools_are_listed_with_strict_schema(self):
+        tools = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})["result"]["tools"]
+        by_name = {tool["name"]: tool for tool in tools}
+        for name in [
+            "oa_get_search_schema",
+            "oa_search_objects",
+            "oa_get_object_detail",
+            "oa_download_attachment",
+            "oa_batch_search_objects",
+        ]:
+            self.assertIn(name, by_name)
+            self.assertFalse(by_name[name]["inputSchema"].get("additionalProperties", True))
+
+        search_props = by_name["oa_search_objects"]["inputSchema"]["properties"]
+        self.assertIn("query", search_props)
+        self.assertNotIn("baseUrl", search_props)
+        self.assertNotIn("insecure", search_props)
+
+    def test_search_tool_calls_delegate_to_client(self):
+        class SearchFakeClient(FakeClient):
+            def get_search_schema(self, scope="all"):
+                return {"scope": scope, "models": [], "searchFields": ["title"], "limits": {}}
+
+            def search_objects(self, **kwargs):
+                return {"query": kwargs["query"], "items": [], "page": 1, "pageSize": 20, "total": 0}
+
+            def get_object_detail(self, record_ref=None, include_text=True, text_limit=12000, fields=None, fd_id=None):
+                return {"recordRef": record_ref, "title": "详情", "text": "", "attachments": []}
+
+            def download_attachment(self, record_ref, attachment_index, output_dir, overwrite=False, max_bytes=52428800, fd_id=None):
+                return {"ok": True, "savedPath": str(Path(output_dir) / "a.pdf"), "bytes": 1}
+
+            def batch_search_objects(self, queries, **kwargs):
+                return {"items": [], "summary": {"totalQueries": len(queries), "matchedQueries": 0, "errors": 0, "downloads": 0}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", SearchFakeClient):
+                    schema = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_get_search_schema", "arguments": {"scope": "knowledge"}},
+                    })
+                    self.assertEqual(json.loads(schema["result"]["content"][0]["text"])["scope"], "knowledge")
+
+                    searched = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "oa_search_objects", "arguments": {"query": "abc", "scope": "knowledge"}},
+                    })
+                    self.assertEqual(json.loads(searched["result"]["content"][0]["text"])["query"], "abc")
+
+                    batched = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {"name": "oa_batch_search_objects", "arguments": {"queries": ["a", "b"], "scope": "knowledge"}},
+                    })
+                    self.assertEqual(json.loads(batched["result"]["content"][0]["text"])["summary"]["totalQueries"], 2)
+
+    def test_new_search_tools_reject_bypass_params(self):
+        """新增 5 个工具注入 baseUrl/insecure 等参数应返回 isError，不调用 FakeClient。"""
+        call_count = {"n": 0}
+
+        class TrackingClient(FakeClient):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                call_count["n"] += 1
+
+            def get_search_schema(self, scope="all"):
+                return {"scope": scope}
+
+            def search_objects(self, **kwargs):
+                return {"query": kwargs["query"], "items": []}
+
+            def get_object_detail(self, record_ref=None, include_text=True, text_limit=12000, fields=None, fd_id=None):
+                return {"recordRef": record_ref, "title": "t", "text": "", "attachments": []}
+
+            def download_attachment(self, record_ref, attachment_index, output_dir, overwrite=False, max_bytes=52428800, fd_id=None):
+                return {"ok": True}
+
+            def batch_search_objects(self, queries, **kwargs):
+                return {"items": [], "summary": {"totalQueries": len(queries), "matchedQueries": 0, "errors": 0, "downloads": 0}}
+
+        bypass_payloads = [
+            {"name": "oa_get_search_schema", "arguments": {"scope": "all", "baseUrl": "https://evil.test/oa/"}},
+            {"name": "oa_search_objects", "arguments": {"query": "test", "insecure": True}},
+            {"name": "oa_get_object_detail", "arguments": {"recordRef": {"scope": "knowledge", "modelName": "KmsMultidocKnowledge", "recordId": "x", "path": "/x?fdId=x"}, "extraParams": "evil"}},
+            {"name": "oa_download_attachment", "arguments": {"recordRef": {"scope": "knowledge", "modelName": "KmsMultidocKnowledge", "recordId": "x", "path": "/x?fdId=x"}, "attachmentIndex": 1, "outputDir": "/tmp", "attachmentUrl": "https://evil.test/"}},
+            {"name": "oa_batch_search_objects", "arguments": {"queries": ["a"], "fileId": "evil"}},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", TrackingClient):
+                    call_count["n"] = 0
+                    for payload in bypass_payloads:
+                        with self.subTest(tool=payload["name"]):
+                            response = mcp_server.handle({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": payload,
+                            })
+                            result = response["result"]
+                            self.assertTrue(result["isError"], f"{payload['name']} 应返回 isError")
+                            text = result["content"][0]["text"]
+                            self.assertIn("不接受参数", text)
+                    # FakeClient 不应被实例化（OAClient 不应被调用）
+                    self.assertEqual(call_count["n"], 0)
+
+
+class SensitiveOutputRegressionTest(unittest.TestCase):
+    def test_new_tool_error_output_does_not_leak_sensitive_patterns(self):
+        class LeakyClient(FakeClient):
+            def search_objects(self, **kwargs):
+                raise RuntimeError("Cookie: abc; Set-Cookie: def; JSESSIONID=ghi; Authorization: Bearer token; <html>full</html>")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", LeakyClient):
+                    response = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_search_objects", "arguments": {"query": "abc"}},
+                    })
+        text = response["result"]["content"][0]["text"]
+        # Verify sensitive patterns are not leaked as standalone tokens
+        for forbidden in ["abc", "ghi", "Bearer token", "<html>"]:
+            self.assertNotRegex(text, rf"\b{re.escape(forbidden)}\b")
+        # "def" is a common substring in words like "description"; check the
+        # redacted reason field directly instead of a whole-text substring match.
+        payload = json.loads(text)
+        self.assertNotRegex(payload["reason"], r"Set-Cookie:\s*\S+")
+
+    def test_existing_direct_execute_is_still_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://oa.example.test/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", FakeClient):
+                    response = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "oa_reject",
+                            "arguments": {"fdId": "1234567890abcdef1234567890abcdef", "note": "不同意", "execute": True},
+                        },
+                    })
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["requiredFlow"], ["oa_prepare_approval", "用户确认审批信息", "oa_confirm_approval"])
 
 
 if __name__ == "__main__":

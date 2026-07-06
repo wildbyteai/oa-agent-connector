@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import ssl
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +19,71 @@ import xml.etree.ElementTree as ET
 FD_ID_RE = re.compile(r"\bfdId[=/]([0-9a-fA-F]{24,40})")
 FD_ID_VALUE_RE = re.compile(r"""(?:["']?fdId["']?\s*[:=]\s*["']|value=["'])([0-9a-fA-F]{24,40})""")
 SUBJECT_RE = re.compile(r"""class=["'][^"']*com_subject[^"']*["'][^>]*>(.*?)</""", re.I | re.S)
+
+SEARCH_LIMITS = {
+    "queryMaxLength": 200,
+    "pageSizeDefault": 20,
+    "pageSizeMax": 50,
+    "batchQueriesMax": 100,
+    "batchPageSizeDefault": 5,
+    "batchPageSizeMax": 20,
+    "maxDetailsPerQueryDefault": 1,
+    "maxDetailsPerQueryMax": 3,
+    "detailTextLimitDefault": 12000,
+    "detailTextLimitMax": 20000,
+    "downloadMaxBytesDefault": 52428800,
+    "batchMaxDownloadsDefault": 0,
+    "batchMaxDownloadsMax": 50,
+}
+
+SEARCH_FIELD_MAP = {
+    "title": "subject",
+    "content": "content",
+    "fdDescription": "fdDescription",
+    "creator": "creator",
+    "attachment": "attachment",
+}
+
+SEARCH_SCOPES = {
+    "all": {
+        "description": "OA 全系统搜索，默认只返回搜索结果元数据，不进入未知模块详情解析",
+        "allowedModelNames": ["*"],
+        "models": [
+            {"modelName": "*", "title": "全部", "supportsDetail": False, "supportsAttachments": False},
+        ],
+    },
+    "knowledge": {
+        "description": "文档知识库",
+        "allowedModelNames": [
+            "KmsMultidocKnowledge",
+            "com.landray.kmss.kms.multidoc.model.KmsMultidocKnowledge",
+        ],
+        "detailParser": "kms_multidoc_knowledge",
+        "models": [
+            {
+                "modelName": "KmsMultidocKnowledge",
+                "title": "文档知识库",
+                "supportsDetail": True,
+                "supportsAttachments": True,
+            },
+        ],
+    },
+    "news": {
+        "description": "新闻文档",
+        "allowedModelNames": ["SysNewsMain", "com.landray.kmss.sys.news.model.SysNewsMain"],
+        "models": [
+            {"modelName": "SysNewsMain", "title": "新闻文档", "supportsDetail": False, "supportsAttachments": False},
+        ],
+    },
+}
+
+ALLOWED_BONDS = ("or", "and", "like")
+ALLOWED_SORT_TYPES = ("relevance", "readCount", "time")
+ALLOWED_SORT_ORDERS = ("asc", "desc")
+ALLOWED_TIME_RANGES = ("", "day", "week", "month", "year")
+ALLOWED_DOC_FILE_TYPES = ("", "pdf", "doc;docx", "xls;xlsx", "ppt;pptx", "txt")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class OAConnectorError(RuntimeError):
@@ -95,6 +161,115 @@ class OAClient:
             handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
         self.opener = urllib.request.build_opener(*handlers)
 
+    def get_search_schema(self, scope: str = "all") -> Dict[str, Any]:
+        scope = scope or "all"
+        config = self._scope_config(scope)
+        return {
+            "scope": scope,
+            "models": list(config.get("models", [])),
+            "searchFields": list(SEARCH_FIELD_MAP.keys()),
+            "bond": list(ALLOWED_BONDS),
+            "sortTypes": list(ALLOWED_SORT_TYPES),
+            "sortOrders": list(ALLOWED_SORT_ORDERS),
+            "timeRanges": [value for value in ALLOWED_TIME_RANGES if value],
+            "docFileTypes": [value for value in ALLOWED_DOC_FILE_TYPES if value],
+            "limits": dict(SEARCH_LIMITS),
+        }
+
+    def _scope_config(self, scope: str) -> Dict[str, Any]:
+        if scope not in SEARCH_SCOPES:
+            raise OAConnectorError("不支持的搜索范围或模块")
+        return SEARCH_SCOPES[scope]
+
+    def _normalize_model_name(self, scope: str, model_name: Optional[str]) -> Optional[str]:
+        if not model_name:
+            return None
+        allowed = self._scope_config(scope).get("allowedModelNames", [])
+        if "*" not in allowed and model_name not in allowed:
+            raise OAConnectorError("不支持的搜索范围或模块")
+        return str(model_name)
+
+    def _validate_search_params(self, params: Dict[str, Any], *, batch: bool = False) -> Dict[str, Any]:
+        query = str(params.get("query") or "").strip()
+        if not query:
+            raise OAConnectorError("搜索关键词不能为空")
+        if len(query) > SEARCH_LIMITS["queryMaxLength"] or CONTROL_CHAR_RE.search(query):
+            raise OAConnectorError("搜索关键词不合法")
+
+        scope = str(params.get("scope") or "all")
+        self._scope_config(scope)
+        model_name = self._normalize_model_name(scope, params.get("modelName"))
+
+        bond = str(params.get("bond") or "or")
+        if bond not in ALLOWED_BONDS:
+            raise OAConnectorError("不支持的关键词关系")
+
+        raw_fields = params.get("searchFields") or []
+        if isinstance(raw_fields, str):
+            raw_fields = [raw_fields]
+        search_fields: List[str] = []
+        for field in raw_fields:
+            field = str(field)
+            if field not in SEARCH_FIELD_MAP:
+                raise OAConnectorError("不支持的搜索字段")
+            search_fields.append(SEARCH_FIELD_MAP[field])
+
+        doc_file_type = str(params.get("docFileType") or "")
+        if doc_file_type not in ALLOWED_DOC_FILE_TYPES:
+            raise OAConnectorError("不支持的附件类型")
+
+        sort_type = str(params.get("sortType") or "relevance")
+        if sort_type not in ALLOWED_SORT_TYPES:
+            raise OAConnectorError("不支持的排序字段")
+        sort_order = str(params.get("sortOrder") or "desc")
+        if sort_order not in ALLOWED_SORT_ORDERS:
+            raise OAConnectorError("不支持的排序方向")
+
+        time_range = str(params.get("timeRange") or "")
+        if time_range not in ALLOWED_TIME_RANGES:
+            raise OAConnectorError("不支持的时间范围")
+
+        from_create_time = str(params.get("fromCreateTime") or "")
+        to_create_time = str(params.get("toCreateTime") or "")
+        for value in (from_create_time, to_create_time):
+            if value and not DATE_RE.match(value):
+                raise OAConnectorError("日期格式必须为 YYYY-MM-DD")
+        if from_create_time and to_create_time and from_create_time > to_create_time:
+            raise OAConnectorError("开始日期不得晚于结束日期")
+
+        default_page_size = SEARCH_LIMITS["batchPageSizeDefault"] if batch else SEARCH_LIMITS["pageSizeDefault"]
+        max_page_size = SEARCH_LIMITS["batchPageSizeMax"] if batch else SEARCH_LIMITS["pageSizeMax"]
+        try:
+            page = int(params.get("page") or 1)
+            page_size = int(params.get("pageSize") or default_page_size)
+        except (ValueError, TypeError):
+            raise OAConnectorError("page/pageSize 必须为正整数")
+        if page < 1:
+            raise OAConnectorError("页码必须大于 0")
+        if page_size < 1 or page_size > max_page_size:
+            raise OAConnectorError("pageSize 超过允许范围")
+
+        return {
+            "query": query,
+            "scope": scope,
+            "modelName": model_name,
+            "bond": bond,
+            "outKeyword": str(params.get("outKeyword") or ""),
+            "searchFields": search_fields,
+            "docFileType": doc_file_type,
+            "timeRange": time_range,
+            "fromCreateTime": from_create_time,
+            "toCreateTime": to_create_time,
+            "category": str(params.get("category") or ""),
+            "docStatus": str(params.get("docStatus") or ""),
+            "sortType": sort_type,
+            "sortOrder": sort_order,
+            "exactTitle": bool(params.get("exactTitle", False)),
+            "onlyExactTitle": bool(params.get("onlyExactTitle", False)),
+            "page": page,
+            "pageSize": page_size,
+        }
+
     def login(self, username: str, password: str) -> bool:
         response = self._request(
             "j_acegi_security_check",
@@ -130,6 +305,263 @@ class OAClient:
         if self._looks_like_login_page(response["url"], response["text"]):
             raise OAConnectorError("当前会话未登录，不能查询待办")
         return self._parse_todos(response["text"])
+
+    def search_objects(self, **kwargs: Any) -> Dict[str, Any]:
+        validated = self._validate_search_params(kwargs)
+        params: Dict[str, str] = {
+            "method": "search",
+            "resultType": "json",
+            "newLUI": "true",
+            "searchAll": "true",
+            "queryString": validated["query"],
+            "pageno": str(validated["page"]),
+            "rowsize": str(validated["pageSize"]),
+            "bond": validated["bond"],
+        }
+        if validated["outKeyword"]:
+            params["outKeyword"] = validated["outKeyword"]
+        if validated["searchFields"]:
+            params["searchFields"] = ",".join(validated["searchFields"])
+        if validated["docFileType"]:
+            params["docFileType"] = validated["docFileType"]
+        if validated["timeRange"]:
+            params["timeRange"] = validated["timeRange"]
+        if validated["fromCreateTime"]:
+            params["fromCreateTime"] = validated["fromCreateTime"]
+        if validated["toCreateTime"]:
+            params["toCreateTime"] = validated["toCreateTime"]
+        if validated["category"]:
+            params["category"] = validated["category"]
+        if validated["docStatus"]:
+            params["docStatus"] = validated["docStatus"]
+        if validated["modelName"]:
+            params["modelName"] = validated["modelName"]
+        if validated["sortType"] != "relevance":
+            params["sortType"] = validated["sortType"]
+        if validated["sortType"] == "time":
+            params["sortOrder"] = validated["sortOrder"]
+
+        response = self._request("sys/ftsearch/searchBuilder.do", params=params)
+        if self._looks_like_login_page(response["url"], response["text"]):
+            raise OAConnectorError("当前会话未登录，不能搜索 OA 内容")
+        parsed = self._try_json(response["text"].lstrip("﻿\r\n\t "))
+        if parsed is None:
+            raise OAConnectorError("搜索出现错误：OA 返回非 JSON 响应")
+        return self._parse_search_results(parsed, validated)
+
+    def _parse_search_results(self, payload: Any, validated: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(payload, dict) and payload.get("EsError"):
+            raise OAConnectorError(f"搜索出现错误：{str(payload.get('EsError'))[:120]}")
+        query_page = payload.get("queryPage", payload) if isinstance(payload, dict) else {}
+        rows = []
+        if isinstance(query_page, dict):
+            rows = query_page.get("list") or query_page.get("rows") or query_page.get("data") or []
+        if not isinstance(rows, list):
+            rows = []
+
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            record_ref = self._record_ref_from_search_row(row, validated["scope"])
+            if not record_ref:
+                continue
+            fields = row.get("lksFieldsMap") if isinstance(row.get("lksFieldsMap"), dict) else {}
+            title = self._clean_search_title(
+                fields.get("subject") or row.get("subject") or row.get("docSubject") or row.get("title") or ""
+            )
+            matched_exact = title == validated["query"] if validated["exactTitle"] else False
+            if validated["onlyExactTitle"] and not matched_exact:
+                continue
+            model_name = str(record_ref.get("modelName") or row.get("modelName") or "")
+            supports_detail, supports_attachments = self._model_capabilities(validated["scope"], model_name)
+            summary = self._strip_html(str(row.get("content") or row.get("fdDescription") or ""))[:300]
+            read_count = self._to_int(row.get("docReadCount") or row.get("readCount"))
+            items.append(
+                {
+                    "recordRef": record_ref,
+                    "fdId": record_ref["recordId"],
+                    "title": title,
+                    "summary": summary,
+                    "creator": self._strip_html(str(row.get("creator") or "")),
+                    "createTime": str(row.get("createTime") or ""),
+                    "readCount": read_count,
+                    "modelTitle": str(row.get("modelTitle") or ""),
+                    "matchedExactTitle": matched_exact,
+                    "supportsDetail": supports_detail,
+                    "supportsAttachments": supports_attachments,
+                }
+            )
+        total = self._to_int(query_page.get("totalrows") if isinstance(query_page, dict) else None)
+        return {
+            "query": validated["query"],
+            "items": items,
+            "page": validated["page"],
+            "pageSize": validated["pageSize"],
+            "total": total if total is not None else len(items),
+            "totalNote": "以 OA 搜索接口返回为准",
+        }
+
+    def _record_ref_from_search_row(self, row: Dict[str, Any], scope: str) -> Optional[Dict[str, str]]:
+        model_name = str(row.get("modelName") or "")
+        path = str(row.get("linkStr") or "")
+        if not path.startswith("/") or path.startswith("//") or ".." in path.split("?")[0].split("/"):
+            return None
+        record_id = str(row.get("docKey") or "").strip()
+        if not record_id:
+            match = re.search(r"(?:fdId=|fdId/)([0-9a-fA-F]{24,40})", path)
+            record_id = match.group(1) if match else ""
+        if not record_id:
+            return None
+        return {"scope": scope, "modelName": model_name, "recordId": record_id, "path": path}
+
+    def _model_capabilities(self, scope: str, model_name: str) -> tuple[bool, bool]:
+        config = self._scope_config(scope)
+        if config.get("detailParser") == "kms_multidoc_knowledge":
+            allowed = config.get("allowedModelNames", [])
+            if model_name in allowed or model_name.endswith("KmsMultidocKnowledge"):
+                return True, True
+        return False, False
+
+    def _clean_search_title(self, value: Any) -> str:
+        return self._strip_html(str(value or ""))
+
+    def get_object_detail(
+        self,
+        record_ref: Optional[Dict[str, Any]] = None,
+        include_text: bool = True,
+        text_limit: int = SEARCH_LIMITS["detailTextLimitDefault"],
+        fields: Optional[List[str]] = None,
+        fd_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del fields
+        if record_ref is None and fd_id:
+            record_ref = {
+                "scope": "knowledge",
+                "modelName": "KmsMultidocKnowledge",
+                "recordId": fd_id,
+                "path": f"/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId={urllib.parse.quote(fd_id)}",
+            }
+        if record_ref is None:
+            raise OAConnectorError("缺少 recordRef")
+        ref = self._validate_record_ref(record_ref)
+        if text_limit < 0 or text_limit > SEARCH_LIMITS["detailTextLimitMax"]:
+            raise OAConnectorError("textLimit 超过允许范围")
+        supports_detail, supports_attachments = self._model_capabilities(ref["scope"], ref["modelName"])
+        if not supports_detail:
+            raise OAConnectorError("该模块不支持详情解析")
+
+        response = self._request(ref["path"])
+        if self._looks_like_login_page(response["url"], response["text"]):
+            raise OAConnectorError("当前会话未登录，不能查看 OA 内容")
+        title = self._extract_title(response["text"])
+        text = ""
+        warning = ""
+        if include_text:
+            text, warning = self._extract_detail_text(response["text"], text_limit)
+        attachments = self._parse_knowledge_attachments(response["text"]) if supports_attachments else []
+        return {
+            "recordRef": ref,
+            "title": title,
+            "text": text,
+            "textExtractionWarning": warning,
+            "attachments": attachments,
+        }
+
+    def _validate_record_ref(self, record_ref: Dict[str, Any]) -> Dict[str, str]:
+        scope = str(record_ref.get("scope") or "")
+        model_name = str(record_ref.get("modelName") or "")
+        record_id = str(record_ref.get("recordId") or "")
+        path = str(record_ref.get("path") or "")
+        self._scope_config(scope)
+        self._normalize_model_name(scope, model_name)
+        if not record_id:
+            raise OAConnectorError("recordRef 无效")
+        if not path.startswith("/") or path.startswith("//"):
+            raise OAConnectorError("recordRef 无效")
+        parsed = urllib.parse.urlsplit(path)
+        if parsed.scheme or parsed.netloc:
+            raise OAConnectorError("recordRef 无效")
+        if ".." in [part for part in parsed.path.split("/") if part]:
+            raise OAConnectorError("recordRef 无效")
+        if record_id not in path:
+            raise OAConnectorError("recordRef 无效")
+        return {"scope": scope, "modelName": model_name, "recordId": record_id, "path": path}
+
+    def _extract_detail_text(self, html_text: str, text_limit: int) -> tuple[str, str]:
+        cleaned = re.sub(r"<script\b.*?</script>", " ", html_text, flags=re.I | re.S)
+        cleaned = re.sub(r"<style\b.*?</style>", " ", cleaned, flags=re.I | re.S)
+        cleaned = re.sub(r"<input\b[^>]*type=[\"']?hidden[\"']?[^>]*>", " ", cleaned, flags=re.I | re.S)
+        warning = ""
+        match = re.search(
+            r"<div[^>]+(?:id|class)=[\"'][^\"']*(?:docContent|fdContent|content|mainContent)[^\"']*[\"'][^>]*>(.*?)</div>",
+            cleaned,
+            flags=re.I | re.S,
+        )
+        if match:
+            source = match.group(1)
+        else:
+            source = cleaned
+            warning = "未识别到模块正文容器，已使用严格截断的页面文本"
+        text = self._strip_html(source)
+        return text[:text_limit], warning
+
+    def _parse_knowledge_attachments(self, html_text: str) -> List[Dict[str, Any]]:
+        attachments: List[Dict[str, Any]] = []
+        pattern = re.compile(r"attachmentObject_attachment\.addDoc\((.*?)\)", re.I | re.S)
+        for match in pattern.finditer(html_text):
+            args = self._parse_js_string_args(match.group(1))
+            if len(args) < 3:
+                continue
+            attachment_id = args[0]
+            file_id = args[1] if len(args) > 1 else ""
+            name = args[2] if len(args) > 2 else ""
+            mime_type = args[3] if len(args) > 3 else ""
+            size = self._to_int(args[4]) if len(args) > 4 else None
+            attachments.append(
+                {
+                    "index": len(attachments) + 1,
+                    "name": name,
+                    "attachmentId": attachment_id,
+                    "fileId": file_id,
+                    "mimeType": mime_type,
+                    "size": size,
+                    "downloadable": bool(attachment_id or file_id),
+                }
+            )
+        return attachments
+
+    def _parse_js_string_args(self, text: str) -> List[str]:
+        values: List[str] = []
+        current: List[str] = []
+        quote: Optional[str] = None
+        escaped = False
+        for ch in text:
+            if quote:
+                if escaped:
+                    current.append("\\" + ch)
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    raw = "".join(current)
+                    try:
+                        values.append(raw.encode("raw_unicode_escape").decode("unicode_escape"))
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        values.append(raw)
+                    current = []
+                    quote = None
+                else:
+                    current.append(ch)
+            elif ch in ("'", '"'):
+                quote = ch
+        return values
+
+    def _to_int(self, value: Any) -> Optional[int]:
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
 
     def get_detail(self, fd_id: str, require_in_todo: bool = True) -> Dict[str, Any]:
         if require_in_todo:
@@ -389,6 +821,38 @@ class OAClient:
         if fd_id not in todo_ids:
             raise PermissionGateError(f"拒绝操作：{fd_id} 不在当前登录账号的待审批列表中")
 
+    def _request_bytes(
+        self,
+        path: str,
+        method: str = "GET",
+        params: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """返回原始 bytes，不做 decode；用于二进制附件下载。"""
+        url = urllib.parse.urljoin(self.base_url, path.lstrip("/"))
+        if params:
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+        body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method=method,
+            headers={
+                "User-Agent": "oa-agent-connector/0.1",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "application/json,text/json,text/html,*/*",
+            },
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout) as resp:
+                raw = resp.read()
+                return {"url": resp.geturl(), "bytes": raw}
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            raise OAConnectorError(f"HTTP {exc.code}: {raw[:500]}") from exc
+        except urllib.error.URLError as exc:
+            raise OAConnectorError(f"请求 OA 失败: {exc}") from exc
+
     def _request(
         self,
         path: str,
@@ -488,7 +952,7 @@ class OAClient:
 
     def _looks_like_login_page(self, url: str, text: str) -> bool:
         lowered = (url + "\n" + text[:3000]).lower()
-        return "j_acegi_security_check" in lowered or "j_username" in lowered and "j_password" in lowered
+        return ("j_acegi_security_check" in lowered) or ("j_username" in lowered and "j_password" in lowered)
 
     def _save_cookies(self) -> None:
         if self.cookie_file:
@@ -509,3 +973,208 @@ class OAClient:
         text = re.sub(r"<[^>]+>", " ", text)
         text = unescape(text)
         return re.sub(r"\s+", " ", text).strip()
+
+    def _safe_filename(self, name: str) -> str:
+        name = str(name or "").replace("\\", "/")
+        name = Path(name).name
+        name = re.sub(r"[\x00-\x1f\x7f/:*?\"<>|]+", "_", name)
+        name = name.replace("..", "_").strip(" .")
+        if not name:
+            name = "attachment"
+        if len(name) > 180:
+            stem = Path(name).stem[:120]
+            suffix = Path(name).suffix[:20]
+            name = f"{stem}{suffix}" if suffix else stem
+        return name
+
+    def _unique_output_path(self, output_dir: Path, filename: str, overwrite: bool) -> Path:
+        output_dir = output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        candidate = (output_dir / filename).resolve()
+        if output_dir not in candidate.parents and candidate != output_dir:
+            raise OAConnectorError("保存附件失败：文件路径不安全")
+        if overwrite or not candidate.exists():
+            return candidate
+        stem = candidate.stem
+        suffix = candidate.suffix
+        counter = 1
+        while True:
+            next_candidate = (output_dir / f"{stem} ({counter}){suffix}").resolve()
+            if not next_candidate.exists():
+                return next_candidate
+            counter += 1
+
+    def batch_search_objects(self, queries: List[str], **kwargs: Any) -> Dict[str, Any]:
+        if not isinstance(queries, list) or not queries:
+            raise OAConnectorError("queries 不能为空")
+        if len(queries) > SEARCH_LIMITS["batchQueriesMax"]:
+            raise OAConnectorError("queries 数量超过允许范围")
+        include_details = bool(kwargs.get("includeDetails", False))
+        include_attachments = bool(kwargs.get("includeAttachments", False))
+        download_first = bool(kwargs.get("downloadFirstAttachment", False))
+        max_details = int(kwargs.get("maxDetailsPerQuery") or SEARCH_LIMITS["maxDetailsPerQueryDefault"])
+        if max_details < 1 or max_details > SEARCH_LIMITS["maxDetailsPerQueryMax"]:
+            raise OAConnectorError("maxDetailsPerQuery 超过允许范围")
+        max_downloads = int(kwargs.get("maxDownloads") or SEARCH_LIMITS["batchMaxDownloadsDefault"])
+        if max_downloads < 0 or max_downloads > SEARCH_LIMITS["batchMaxDownloadsMax"]:
+            raise OAConnectorError("maxDownloads 超过允许范围")
+
+        # 显式校验批量模式下的 pageSize
+        raw_page_size = kwargs.get("pageSize")
+        if raw_page_size is not None:
+            ps = int(raw_page_size)
+            if ps < 1 or ps > SEARCH_LIMITS["batchPageSizeMax"]:
+                raise OAConnectorError("pageSize 超过允许范围")
+
+        items: List[Dict[str, Any]] = []
+        matched_queries = 0
+        errors = 0
+        downloads = 0
+        for query in queries:
+            item: Dict[str, Any] = {"query": query, "matched": False, "resultCount": 0, "results": [], "error": None}
+            try:
+                search_kwargs = dict(kwargs)
+                search_kwargs.pop("includeDetails", None)
+                search_kwargs.pop("includeAttachments", None)
+                search_kwargs.pop("downloadFirstAttachment", None)
+                search_kwargs.pop("maxDetailsPerQuery", None)
+                search_kwargs.pop("maxDownloads", None)
+                search_kwargs.pop("outputDir", None)
+                search_kwargs["query"] = query
+                search_kwargs["pageSize"] = int(kwargs.get("pageSize") or SEARCH_LIMITS["batchPageSizeDefault"])
+                result = self.search_objects(**search_kwargs)
+                results = result.get("items", [])
+                item["matched"] = bool(results)
+                item["resultCount"] = len(results)
+                if results:
+                    matched_queries += 1
+                for result_item in results[: max_details if (include_details or include_attachments or download_first) else len(results)]:
+                    compact: Dict[str, Any] = {
+                        "recordRef": result_item.get("recordRef"),
+                        "title": result_item.get("title"),
+                        "matchedExactTitle": result_item.get("matchedExactTitle", False),
+                        "attachments": [],
+                        "downloaded": [],
+                    }
+                    if include_details or include_attachments or download_first:
+                        detail = self.get_object_detail(record_ref=result_item["recordRef"], include_text=include_details)
+                        if include_details:
+                            compact["text"] = detail.get("text", "")
+                            compact["textExtractionWarning"] = detail.get("textExtractionWarning", "")
+                        if include_attachments or download_first:
+                            compact["attachments"] = detail.get("attachments", [])
+                    if download_first and compact["attachments"]:
+                        if (
+                            not kwargs.get("exactTitle")
+                            or not kwargs.get("onlyExactTitle")
+                            or not compact.get("matchedExactTitle")
+                        ):
+                            pass
+                        elif max_downloads <= 0 or downloads >= max_downloads:
+                            pass
+                        else:
+                            downloaded = self.download_attachment(
+                                result_item["recordRef"],
+                                attachment_index=int(compact["attachments"][0]["index"]),
+                                output_dir=str(kwargs.get("outputDir") or "~/Downloads/oa-attachments"),
+                                overwrite=bool(kwargs.get("overwrite", False)),
+                                max_bytes=int(kwargs.get("maxBytes") or SEARCH_LIMITS["downloadMaxBytesDefault"]),
+                            )
+                            compact["downloaded"].append(downloaded)
+                            downloads += 1
+                    item["results"].append(compact)
+            except Exception as exc:
+                errors += 1
+                item["error"] = self._sanitize_error(exc)
+            items.append(item)
+        return {
+            "items": items,
+            "summary": {
+                "totalQueries": len(queries),
+                "matchedQueries": matched_queries,
+                "errors": errors,
+                "downloads": downloads,
+            },
+        }
+
+    def _sanitize_error(self, exc: Exception) -> str:
+        text = str(exc)
+        text = re.sub(
+            r"(?i)(?:cookie|set-cookie|jsessionid|authorization|password|j_password)\s*[:=][^\s,;]+",
+            "[redacted]",
+            text,
+        )
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", text).strip()[:200]
+
+    def download_attachment(
+        self,
+        record_ref: Optional[Dict[str, Any]],
+        attachment_index: int,
+        output_dir: str,
+        overwrite: bool = False,
+        max_bytes: int = SEARCH_LIMITS["downloadMaxBytesDefault"],
+        fd_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if max_bytes < 1 or max_bytes > SEARCH_LIMITS["downloadMaxBytesDefault"]:
+            raise OAConnectorError("附件超过下载大小上限")
+        detail = self.get_object_detail(record_ref=record_ref, include_text=False, fd_id=fd_id)
+        attachments = detail.get("attachments") or []
+        selected = None
+        for attachment in attachments:
+            if int(attachment.get("index") or 0) == int(attachment_index):
+                selected = attachment
+                break
+        if selected is None:
+            raise OAConnectorError("附件序号不存在")
+        if selected.get("size") is not None and int(selected["size"]) > max_bytes:
+            raise OAConnectorError("附件超过下载大小上限")
+
+        filename = self._safe_filename(str(selected.get("name") or "attachment"))
+        output_path = self._unique_output_path(Path(output_dir), filename, overwrite)
+        download_path = self._attachment_download_path(detail["recordRef"], selected)
+        response = self._request_bytes(download_path)
+        raw = response["bytes"]
+        # 登录页/HTML 检测：检查前 512 字节
+        head = raw[:512]
+        if self._looks_like_login_page(response["url"], head.decode("utf-8", errors="replace")):
+            raise OAConnectorError("下载附件失败，当前会话可能失效或无权限")
+        if b"<html" in head.lower():
+            raise OAConnectorError("下载附件失败，当前会话可能失效或无权限")
+        if len(raw) > max_bytes:
+            raise OAConnectorError("附件超过下载大小上限")
+
+        temp_path = output_path.with_name(f".{output_path.name}.tmp")
+        try:
+            with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False) as temp_file:
+                temp_file.write(raw)
+                temp_path = Path(temp_file.name)
+            temp_path.replace(output_path)
+        except OSError as exc:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            raise OAConnectorError(f"保存附件失败: {str(exc)[:120]}") from exc
+
+        return {
+            "ok": True,
+            "recordRef": detail["recordRef"],
+            "attachment": {
+                "index": selected.get("index"),
+                "name": selected.get("name"),
+                "attachmentId": selected.get("attachmentId"),
+                "mimeType": selected.get("mimeType"),
+                "size": selected.get("size"),
+            },
+            "savedPath": str(output_path),
+            "bytes": len(raw),
+        }
+
+    def _attachment_download_path(self, record_ref: Dict[str, str], attachment: Dict[str, Any]) -> str:
+        attachment_id = urllib.parse.quote(str(attachment.get("attachmentId") or ""))
+        file_id = urllib.parse.quote(str(attachment.get("fileId") or ""))
+        if not attachment_id and not file_id:
+            raise OAConnectorError("附件序号不存在")
+        query = urllib.parse.urlencode({"method": "download", "fdId": attachment_id, "fileId": file_id, "modelId": record_ref["recordId"]})
+        return f"/sys/attachment/sys_att_main/sysAttMain.do?{query}"
