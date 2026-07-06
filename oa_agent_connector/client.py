@@ -920,7 +920,7 @@ class OAClient:
 
     def _looks_like_login_page(self, url: str, text: str) -> bool:
         lowered = (url + "\n" + text[:3000]).lower()
-        return "j_acegi_security_check" in lowered or "j_username" in lowered and "j_password" in lowered
+        return ("j_acegi_security_check" in lowered) or ("j_username" in lowered and "j_password" in lowered)
 
     def _save_cookies(self) -> None:
         if self.cookie_file:
@@ -1000,7 +1000,7 @@ class OAClient:
         download_path = self._attachment_download_path(detail["recordRef"], selected)
         response = self._request(download_path)
         text = response["text"]
-        if self._looks_like_login_page(response["url"], text) or "<html" in text[:200].lower():
+        if self._looks_like_login_page(response["url"], text) or "<html" in text[:512].lower():
             raise OAConnectorError("下载附件失败，当前会话可能失效或无权限")
         raw = text.encode("utf-8")
         if len(raw) > max_bytes:
@@ -1008,7 +1008,9 @@ class OAClient:
 
         temp_path = output_path.with_name(f".{output_path.name}.tmp")
         try:
-            temp_path.write_bytes(raw)
+            with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=f".{output_path.name}.", suffix=".tmp", delete=False) as temp_file:
+                temp_file.write(raw)
+                temp_path = Path(temp_file.name)
             temp_path.replace(output_path)
         except OSError as exc:
             try:
