@@ -272,5 +272,67 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertEqual(client.last_request["params"]["searchFields"], "subject,attachment")
 
 
+class FakeDetailClient(OAClient):
+    def __init__(self, html_text):
+        super().__init__("https://oa.example.test/")
+        self.html_text = html_text
+        self.last_request = None
+
+    def _request(self, path, method="GET", params=None, data=None):
+        self.last_request = {"path": path, "method": method, "params": params or {}, "data": data}
+        return {"url": "https://oa.example.test/detail", "text": self.html_text}
+
+
+class ObjectDetailTest(unittest.TestCase):
+    def test_get_object_detail_extracts_text_and_attachments(self):
+        html_text = """
+        <html><head><title>出厂报告-产品A</title><script>var token='secret';</script></head>
+        <body>
+          <nav>首页 导航</nav>
+          <input type="hidden" name="csrf" value="hidden-token">
+          <div id="docContent">正文第一段 <b>正文第二段</b></div>
+          <script>
+            attachmentObject_attachment.addDoc('att-1','file-1','附件一.pdf','application/pdf','200261');
+            attachmentObject_attachment.addDoc("att-2","file-2","\\u9644\\u4ef6\\u4e8c.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document","1024");
+          </script>
+        </body></html>
+        """
+        client = FakeDetailClient(html_text)
+        ref = {
+            "scope": "knowledge",
+            "modelName": "com.landray.kmss.kms.multidoc.model.KmsMultidocKnowledge",
+            "recordId": "18256d188087f3669a0808d440da67a6",
+            "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+        }
+
+        detail = client.get_object_detail(record_ref=ref, include_text=True, text_limit=12000)
+
+        self.assertEqual(detail["title"], "出厂报告-产品A")
+        self.assertIn("正文第一段", detail["text"])
+        self.assertNotIn("hidden-token", detail["text"])
+        self.assertNotIn("secret", detail["text"])
+        self.assertEqual(len(detail["attachments"]), 2)
+        self.assertEqual(detail["attachments"][0]["index"], 1)
+        self.assertEqual(detail["attachments"][0]["name"], "附件一.pdf")
+        self.assertEqual(detail["attachments"][0]["attachmentId"], "att-1")
+        self.assertEqual(detail["attachments"][0]["fileId"], "file-1")
+        self.assertEqual(detail["attachments"][0]["size"], 200261)
+        self.assertNotIn("url", detail["attachments"][0])
+
+    def test_validate_record_ref_rejects_unsafe_paths(self):
+        client = FakeDetailClient("ok")
+        bad_refs = [
+            {"scope": "knowledge", "modelName": "KmsMultidocKnowledge", "recordId": "1", "path": "https://evil.test/a"},
+            {"scope": "knowledge", "modelName": "KmsMultidocKnowledge", "recordId": "1", "path": "//evil.test/a"},
+            {"scope": "knowledge", "modelName": "KmsMultidocKnowledge", "recordId": "1", "path": "/kms/../secret?fdId=1"},
+            {"scope": "unknown", "modelName": "KmsMultidocKnowledge", "recordId": "1", "path": "/kms/a?fdId=1"},
+            {"scope": "knowledge", "modelName": "BadModel", "recordId": "1", "path": "/kms/a?fdId=1"},
+        ]
+        for ref in bad_refs:
+            with self.subTest(ref=ref):
+                with self.assertRaises(OAConnectorError):
+                    client._validate_record_ref(ref)
+
+
 if __name__ == "__main__":
     unittest.main()

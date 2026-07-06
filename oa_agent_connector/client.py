@@ -425,6 +425,137 @@ class OAClient:
     def _clean_search_title(self, value: Any) -> str:
         return self._strip_html(str(value or ""))
 
+    def get_object_detail(
+        self,
+        record_ref: Optional[Dict[str, Any]] = None,
+        include_text: bool = True,
+        text_limit: int = SEARCH_LIMITS["detailTextLimitDefault"],
+        fields: Optional[List[str]] = None,
+        fd_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        del fields
+        if record_ref is None and fd_id:
+            record_ref = {
+                "scope": "knowledge",
+                "modelName": "KmsMultidocKnowledge",
+                "recordId": fd_id,
+                "path": f"/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId={urllib.parse.quote(fd_id)}",
+            }
+        if record_ref is None:
+            raise OAConnectorError("缺少 recordRef")
+        ref = self._validate_record_ref(record_ref)
+        if text_limit < 0 or text_limit > SEARCH_LIMITS["detailTextLimitMax"]:
+            raise OAConnectorError("textLimit 超过允许范围")
+        supports_detail, supports_attachments = self._model_capabilities(ref["scope"], ref["modelName"])
+        if not supports_detail:
+            raise OAConnectorError("该模块不支持详情解析")
+
+        response = self._request(ref["path"])
+        if self._looks_like_login_page(response["url"], response["text"]):
+            raise OAConnectorError("当前会话未登录，不能查看 OA 内容")
+        title = self._extract_title(response["text"])
+        text = ""
+        warning = ""
+        if include_text:
+            text, warning = self._extract_detail_text(response["text"], text_limit)
+        attachments = self._parse_knowledge_attachments(response["text"]) if supports_attachments else []
+        return {
+            "recordRef": ref,
+            "title": title,
+            "text": text,
+            "textExtractionWarning": warning,
+            "attachments": attachments,
+        }
+
+    def _validate_record_ref(self, record_ref: Dict[str, Any]) -> Dict[str, str]:
+        scope = str(record_ref.get("scope") or "")
+        model_name = str(record_ref.get("modelName") or "")
+        record_id = str(record_ref.get("recordId") or "")
+        path = str(record_ref.get("path") or "")
+        self._scope_config(scope)
+        self._normalize_model_name(scope, model_name)
+        if not record_id:
+            raise OAConnectorError("recordRef 无效")
+        if not path.startswith("/") or path.startswith("//"):
+            raise OAConnectorError("recordRef 无效")
+        parsed = urllib.parse.urlsplit(path)
+        if parsed.scheme or parsed.netloc:
+            raise OAConnectorError("recordRef 无效")
+        if ".." in [part for part in parsed.path.split("/") if part]:
+            raise OAConnectorError("recordRef 无效")
+        if record_id not in path:
+            raise OAConnectorError("recordRef 无效")
+        return {"scope": scope, "modelName": model_name, "recordId": record_id, "path": path}
+
+    def _extract_detail_text(self, html_text: str, text_limit: int) -> tuple[str, str]:
+        cleaned = re.sub(r"<script\b.*?</script>", " ", html_text, flags=re.I | re.S)
+        cleaned = re.sub(r"<style\b.*?</style>", " ", cleaned, flags=re.I | re.S)
+        cleaned = re.sub(r"<input\b[^>]*type=[\"']?hidden[\"']?[^>]*>", " ", cleaned, flags=re.I | re.S)
+        warning = ""
+        match = re.search(
+            r"<div[^>]+(?:id|class)=[\"'][^\"']*(?:docContent|fdContent|content|mainContent)[^\"']*[\"'][^>]*>(.*?)</div>",
+            cleaned,
+            flags=re.I | re.S,
+        )
+        if match:
+            source = match.group(1)
+        else:
+            source = cleaned
+            warning = "未识别到模块正文容器，已使用严格截断的页面文本"
+        text = self._strip_html(source)
+        return text[:text_limit], warning
+
+    def _parse_knowledge_attachments(self, html_text: str) -> List[Dict[str, Any]]:
+        attachments: List[Dict[str, Any]] = []
+        pattern = re.compile(r"attachmentObject_attachment\.addDoc\((.*?)\)", re.I | re.S)
+        for match in pattern.finditer(html_text):
+            args = self._parse_js_string_args(match.group(1))
+            if len(args) < 3:
+                continue
+            attachment_id = args[0]
+            file_id = args[1] if len(args) > 1 else ""
+            name = args[2] if len(args) > 2 else ""
+            mime_type = args[3] if len(args) > 3 else ""
+            size = self._to_int(args[4]) if len(args) > 4 else None
+            attachments.append(
+                {
+                    "index": len(attachments) + 1,
+                    "name": name,
+                    "attachmentId": attachment_id,
+                    "fileId": file_id,
+                    "mimeType": mime_type,
+                    "size": size,
+                    "downloadable": bool(attachment_id or file_id),
+                }
+            )
+        return attachments
+
+    def _parse_js_string_args(self, text: str) -> List[str]:
+        values: List[str] = []
+        current: List[str] = []
+        quote: Optional[str] = None
+        escaped = False
+        for ch in text:
+            if quote:
+                if escaped:
+                    current.append("\\" + ch)
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    raw = "".join(current)
+                    try:
+                        values.append(raw.encode("raw_unicode_escape").decode("unicode_escape"))
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        values.append(raw)
+                    current = []
+                    quote = None
+                else:
+                    current.append(ch)
+            elif ch in ("'", '"'):
+                quote = ch
+        return values
+
     def _to_int(self, value: Any) -> Optional[int]:
         try:
             return int(str(value).strip())
