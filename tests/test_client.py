@@ -1,5 +1,7 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from oa_agent_connector.client import OAClient, OAConnectorError, PermissionGateError
 
@@ -332,6 +334,71 @@ class ObjectDetailTest(unittest.TestCase):
             with self.subTest(ref=ref):
                 with self.assertRaises(OAConnectorError):
                     client._validate_record_ref(ref)
+
+
+class FakeDownloadClient(OAClient):
+    def __init__(self, detail_html, download_text):
+        super().__init__("https://oa.example.test/")
+        self.detail_html = detail_html
+        self.download_text = download_text
+        self.requests = []
+
+    def _request(self, path, method="GET", params=None, data=None):
+        self.requests.append({"path": path, "method": method, "params": params or {}, "data": data})
+        if "sys_att_main" in path:
+            return {"url": "https://oa.example.test/sys/attachment/sys_att_main/sysAttMain.do", "text": self.download_text}
+        return {"url": "https://oa.example.test/detail", "text": self.detail_html}
+
+
+class AttachmentDownloadTest(unittest.TestCase):
+    def test_safe_filename_removes_path_tricks(self):
+        client = FakeDownloadClient("", "")
+        self.assertEqual(client._safe_filename("../报告/产品A.pdf"), "产品A.pdf")
+        self.assertEqual(client._safe_filename("C:\\tmp\\产品A.pdf"), "产品A.pdf")
+        self.assertEqual(client._safe_filename("bad\x00:name?.pdf"), "bad_name_.pdf")
+        self.assertEqual(client._safe_filename(""), "attachment")
+
+    def test_download_attachment_saves_file_and_avoids_duplicates(self):
+        detail_html = """
+        <html><title>出厂报告-产品A</title><body>
+        <script>attachmentObject_attachment.addDoc('att-1','file-1','../报告/产品A.pdf','application/pdf','3');</script>
+        </body></html>
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = FakeDownloadClient(detail_html, "PDF")
+            ref = {
+                "scope": "knowledge",
+                "modelName": "KmsMultidocKnowledge",
+                "recordId": "18256d188087f3669a0808d440da67a6",
+                "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+            }
+            first = client.download_attachment(ref, attachment_index=1, output_dir=tmpdir, overwrite=False, max_bytes=10)
+            second = client.download_attachment(ref, attachment_index=1, output_dir=tmpdir, overwrite=False, max_bytes=10)
+
+            self.assertTrue(Path(first["savedPath"]).exists())
+            self.assertTrue(Path(second["savedPath"]).exists())
+            self.assertTrue(first["savedPath"].endswith("产品A.pdf"))
+            self.assertTrue(second["savedPath"].endswith("产品A (1).pdf"))
+            self.assertEqual(first["bytes"], 3)
+
+    def test_download_rejects_html_response_and_large_file(self):
+        detail_html = """
+        <script>attachmentObject_attachment.addDoc('att-1','file-1','产品A.pdf','application/pdf','100');</script>
+        """
+        ref = {
+            "scope": "knowledge",
+            "modelName": "KmsMultidocKnowledge",
+            "recordId": "18256d188087f3669a0808d440da67a6",
+            "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_client = FakeDownloadClient(detail_html, "<html>login</html>")
+            with self.assertRaises(OAConnectorError):
+                html_client.download_attachment(ref, 1, tmpdir, max_bytes=1000)
+
+            large_client = FakeDownloadClient(detail_html, "x" * 11)
+            with self.assertRaises(OAConnectorError):
+                large_client.download_attachment(ref, 1, tmpdir, max_bytes=10)
 
 
 if __name__ == "__main__":

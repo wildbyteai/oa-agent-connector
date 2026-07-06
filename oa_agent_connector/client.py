@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import ssl
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -940,3 +941,100 @@ class OAClient:
         text = re.sub(r"<[^>]+>", " ", text)
         text = unescape(text)
         return re.sub(r"\s+", " ", text).strip()
+
+    def _safe_filename(self, name: str) -> str:
+        name = str(name or "").replace("\\", "/")
+        name = Path(name).name
+        name = re.sub(r"[\x00-\x1f\x7f/:*?\"<>|]+", "_", name)
+        name = name.replace("..", "_").strip(" .")
+        if not name:
+            name = "attachment"
+        if len(name) > 180:
+            stem = Path(name).stem[:120]
+            suffix = Path(name).suffix[:20]
+            name = f"{stem}{suffix}" if suffix else stem
+        return name
+
+    def _unique_output_path(self, output_dir: Path, filename: str, overwrite: bool) -> Path:
+        output_dir = output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        candidate = (output_dir / filename).resolve()
+        if output_dir not in candidate.parents and candidate != output_dir:
+            raise OAConnectorError("保存附件失败：文件路径不安全")
+        if overwrite or not candidate.exists():
+            return candidate
+        stem = candidate.stem
+        suffix = candidate.suffix
+        counter = 1
+        while True:
+            next_candidate = (output_dir / f"{stem} ({counter}){suffix}").resolve()
+            if not next_candidate.exists():
+                return next_candidate
+            counter += 1
+
+    def download_attachment(
+        self,
+        record_ref: Optional[Dict[str, Any]],
+        attachment_index: int,
+        output_dir: str,
+        overwrite: bool = False,
+        max_bytes: int = SEARCH_LIMITS["downloadMaxBytesDefault"],
+        fd_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if max_bytes < 1 or max_bytes > SEARCH_LIMITS["downloadMaxBytesDefault"]:
+            raise OAConnectorError("附件超过下载大小上限")
+        detail = self.get_object_detail(record_ref=record_ref, include_text=False, fd_id=fd_id)
+        attachments = detail.get("attachments") or []
+        selected = None
+        for attachment in attachments:
+            if int(attachment.get("index") or 0) == int(attachment_index):
+                selected = attachment
+                break
+        if selected is None:
+            raise OAConnectorError("附件序号不存在")
+        if selected.get("size") is not None and int(selected["size"]) > max_bytes:
+            raise OAConnectorError("附件超过下载大小上限")
+
+        filename = self._safe_filename(str(selected.get("name") or "attachment"))
+        output_path = self._unique_output_path(Path(output_dir), filename, overwrite)
+        download_path = self._attachment_download_path(detail["recordRef"], selected)
+        response = self._request(download_path)
+        text = response["text"]
+        if self._looks_like_login_page(response["url"], text) or "<html" in text[:200].lower():
+            raise OAConnectorError("下载附件失败，当前会话可能失效或无权限")
+        raw = text.encode("utf-8")
+        if len(raw) > max_bytes:
+            raise OAConnectorError("附件超过下载大小上限")
+
+        temp_path = output_path.with_name(f".{output_path.name}.tmp")
+        try:
+            temp_path.write_bytes(raw)
+            temp_path.replace(output_path)
+        except OSError as exc:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            raise OAConnectorError(f"保存附件失败: {str(exc)[:120]}") from exc
+
+        return {
+            "ok": True,
+            "recordRef": detail["recordRef"],
+            "attachment": {
+                "index": selected.get("index"),
+                "name": selected.get("name"),
+                "attachmentId": selected.get("attachmentId"),
+                "mimeType": selected.get("mimeType"),
+                "size": selected.get("size"),
+            },
+            "savedPath": str(output_path),
+            "bytes": len(raw),
+        }
+
+    def _attachment_download_path(self, record_ref: Dict[str, str], attachment: Dict[str, Any]) -> str:
+        attachment_id = urllib.parse.quote(str(attachment.get("attachmentId") or ""))
+        file_id = urllib.parse.quote(str(attachment.get("fileId") or ""))
+        if not attachment_id and not file_id:
+            raise OAConnectorError("附件序号不存在")
+        query = urllib.parse.urlencode({"method": "download", "fdId": attachment_id, "fileId": file_id, "modelId": record_ref["recordId"]})
+        return f"/sys/attachment/sys_att_main/sysAttMain.do?{query}"
