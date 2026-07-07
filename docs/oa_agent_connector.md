@@ -48,11 +48,15 @@ MCP 模式建议始终配置 `OA_AGENT_STATE_DIR` 为目标电脑上的真实绝
 oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 ```
 
+MCP 普通授权默认使用 `oa_begin_auth` 本机授权页。`oa_login` 默认不暴露给普通 Agent；只有管理员显式设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时才开放。`oa_begin_auth` 默认要求 OA 地址为 HTTPS；如果企业内网 OA 只能 HTTP，需要管理员显式设置 `OA_AGENT_ALLOW_INSECURE_AUTH=1`。
+
 ## Agent 工具封装建议
 
 对外暴露工具时建议只暴露以下动作：
 
-- `login(base_url, username, password)`
+- `begin_auth(base_url)`：默认授权入口，返回本机授权链接
+- `local_auth_status(auth_token)`
+- `login(base_url, username, password)`：兼容或调试入口，默认不暴露；不建议普通用户在聊天里输入密码
 - `list_todos(page, page_size)`
 - `get_detail(fd_id)`
 - `search_objects(query, scope, page, page_size)`

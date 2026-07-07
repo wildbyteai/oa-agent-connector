@@ -21,9 +21,9 @@
 3. 运行 `oa-agent-mcp-config --base-url "<用户提供的OA地址>"` 生成 MCP 配置。
 4. 确认配置里有这台电脑真实的 `OA_AGENT_STATE_DIR`，不要手写占位符。
 5. 把生成的 MCP 配置加入 Agent 客户端，并刷新或重启 MCP 工具。
-6. 引导用户用自己的 OA 账号登录授权。密码只用于登录，不保存。
+6. 引导用户点击本机 OA 授权链接登录。密码只在本机授权页面输入，不进入聊天记录，不保存。
 7. 不要主动删除已有 cookie，只有登录明确失效时才重新授权。
-8. 如果 MCP 返回 `reauthRequired=true` 且带有 `nextAction`，直接按 `nextAction` 发起重新授权流程：使用已配置的 OA 地址，只向用户索取 OA 账号和密码，然后调用 `oa_login`。
+8. 如果 MCP 返回 `reauthRequired=true` 且带有 `nextAction`，直接按 `nextAction` 调用 `oa_begin_auth`，把返回的本机授权链接发给用户点击。
 9. 如果 MCP 返回 `configurationRequired=true`，先补齐 OA 地址并重新生成 MCP 配置，再授权。
 
 安装或升级命令：
@@ -52,6 +52,12 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 把命令输出的 JSON 放到 Agent 客户端 MCP 配置里即可。macOS 和 Windows 都兼容。
 
+安全默认值：
+
+- 普通授权默认走 `oa_begin_auth` 本机授权页。
+- `oa_login` 默认不会出现在 MCP 工具列表里。只有管理员显式设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时，才开放兼容登录工具。
+- 本机授权默认要求 OA 地址是 HTTPS，且不允许跳过证书校验。如果企业内网 OA 只能使用 HTTP，必须由管理员显式设置 `OA_AGENT_ALLOW_INSECURE_AUTH=1` 后再使用。
+
 ## 用户怎么用
 
 配置完成后，用户只需要对 Agent 说：
@@ -60,7 +66,7 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 查看我的 OA 待办
 ```
 
-第一次使用时，Agent 会要求用户输入自己的 OA 账号和密码完成授权。密码只用于登录，不会保存。
+第一次使用时，Agent 会给用户一个本机 OA 授权链接。用户点击链接，在本机页面输入自己的 OA 账号和密码完成授权。密码不会进入聊天记录，也不会保存。
 
 之后可以继续说：
 
@@ -194,7 +200,9 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 如果还没有登录，Agent 应提示：
 
 ```text
-当前还没有完成 OA 授权。请提供你的 OA 账号和密码，我会用它登录 OA。密码只用于本次授权，不会保存。
+当前还没有完成 OA 授权。
+
+请点击下面的本机授权链接，在页面里输入 OA 账号和密码。密码只用于本次登录，不会保存，也不会发到聊天里。
 ```
 
 ## 更多说明

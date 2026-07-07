@@ -51,15 +51,19 @@ class MCPServerTest(unittest.TestCase):
         init = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "oa-agent-connector")
 
-        tools = mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        with patch.dict("os.environ", {"OA_AGENT_ENABLE_PASSWORD_LOGIN": ""}, clear=False):
+            tools = mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         names = {tool["name"] for tool in tools["result"]["tools"]}
         self.assertIn("oa_setup_guide", names)
-        self.assertIn("oa_login", names)
+        self.assertIn("oa_begin_auth", names)
+        self.assertIn("oa_local_auth_status", names)
+        self.assertNotIn("oa_login", names)
         self.assertIn("oa_list_todos", names)
+        self.assertNotIn("password", json.dumps(tools["result"]["tools"], ensure_ascii=False).lower())
 
     def test_login_then_list_todos(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_AGENT_ENABLE_PASSWORD_LOGIN": "1"}, clear=False):
                 with patch.object(mcp_server, "OAClient", FakeClient):
                     login = mcp_server.handle(
                         {
@@ -91,6 +95,34 @@ class MCPServerTest(unittest.TestCase):
                     self.assertEqual(payload["items"][0]["subject"], "采购审批")
                     self.assertEqual(payload["items"][0]["detailUrl"], "https://example.invalid/oa/km/review/km_review_main/kmReviewMain.do?method=view&fdId=1234567890abcdef1234567890abcdef")
 
+    def test_password_login_hidden_and_disabled_by_default(self):
+        with patch.dict("os.environ", {"OA_AGENT_ENABLE_PASSWORD_LOGIN": ""}, clear=False):
+            response = mcp_server.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "oa_login",
+                        "arguments": {
+                            "baseUrl": "https://example.invalid/oa/",
+                            "username": "u",
+                            "password": "p",
+                        },
+                    },
+                }
+            )
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertIn("oa_begin_auth", payload["reason"])
+        self.assertNotIn("password", json.dumps(payload, ensure_ascii=False).lower())
+
+    def test_password_login_can_be_explicitly_enabled_for_compatibility(self):
+        with patch.dict("os.environ", {"OA_AGENT_ENABLE_PASSWORD_LOGIN": "1"}, clear=False):
+            tools = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        names = {tool["name"] for tool in tools["result"]["tools"]}
+        self.assertIn("oa_login", names)
+
     def test_list_todos_without_config_returns_guide(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=True):
@@ -106,14 +138,14 @@ class MCPServerTest(unittest.TestCase):
                 self.assertTrue(result["isError"])
                 payload = json.loads(result["content"][0]["text"])
                 self.assertIn("guide", payload)
-                self.assertEqual(payload["guide"][1]["tool"], "oa_login")
+                self.assertEqual(payload["guide"][1]["tool"], "oa_begin_auth")
                 self.assertTrue(payload["configurationRequired"])
                 self.assertFalse(payload["reauthRequired"])
                 self.assertIsNone(payload["nextAction"])
 
     def test_auth_error_does_not_delete_cookie_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_AGENT_ENABLE_PASSWORD_LOGIN": "1"}, clear=False):
                 with patch.object(mcp_server, "OAClient", FakeClient):
                     mcp_server.handle(
                         {
@@ -145,13 +177,92 @@ class MCPServerTest(unittest.TestCase):
                 self.assertTrue(listed["result"]["isError"])
                 payload = json.loads(listed["result"]["content"][0]["text"])
                 self.assertTrue(payload["reauthRequired"])
-                self.assertEqual(payload["nextAction"]["tool"], "oa_login")
+                self.assertEqual(payload["nextAction"]["tool"], "oa_begin_auth")
                 self.assertEqual(payload["nextAction"]["arguments"]["baseUrl"], "https://example.invalid/oa/")
+                self.assertNotIn("fallbackAction", payload)
+                self.assertNotIn("password", json.dumps(payload, ensure_ascii=False).lower())
                 self.assertTrue(cookie_path.exists())
+
+    def test_begin_auth_returns_local_url_without_password(self):
+        calls = {}
+
+        def fake_begin_local_auth(**kwargs):
+            calls.update(kwargs)
+            return {
+                "ok": True,
+                "authRequired": True,
+                "authUrl": "http://127.0.0.1:12345/authorize?state=abc",
+                "authToken": "abc",
+                "session": kwargs["session"],
+                "baseUrl": kwargs["base_url"],
+                "expiresAt": 123,
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
+                with patch.object(mcp_server, "begin_local_auth", fake_begin_local_auth):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_begin_auth",
+                                "arguments": {"session": "work", "expiresInSeconds": 120},
+                            },
+                        }
+                    )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["authUrl"], "http://127.0.0.1:12345/authorize?state=abc")
+        self.assertNotIn("password", json.dumps(payload, ensure_ascii=False).lower())
+        self.assertEqual(calls["base_url"], "https://example.invalid/oa/")
+        self.assertEqual(calls["session"], "work")
+        self.assertEqual(calls["state_dir"], tmpdir)
+        self.assertEqual(calls["expires_in"], 120)
+
+    def test_begin_auth_rejects_http_without_admin_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://example.invalid/oa/", "OA_AGENT_ALLOW_INSECURE_AUTH": ""},
+                clear=False,
+            ):
+                response = mcp_server.handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_begin_auth", "arguments": {}},
+                    }
+                )
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertIn("HTTPS", payload["reason"])
+        self.assertNotIn("authUrl", payload)
+
+    def test_local_auth_status_reads_status_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            status_dir = Path(tmpdir) / "local-auth"
+            status_dir.mkdir()
+            (status_dir / "abc.json").write_text(
+                json.dumps({"ok": True, "status": "success", "authToken": "abc"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                response = mcp_server.handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_local_auth_status", "arguments": {"authToken": "abc"}},
+                    }
+                )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["status"], "success")
 
     def test_prepare_then_confirm_approval(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_AGENT_ENABLE_PASSWORD_LOGIN": "1"}, clear=False):
                 with patch.object(mcp_server, "OAClient", FakeClient):
                     mcp_server.handle(
                         {
@@ -381,9 +492,10 @@ class SearchMCPServerTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertTrue(response["result"]["isError"])
         self.assertTrue(payload["reauthRequired"])
-        self.assertEqual(payload["nextAction"]["tool"], "oa_login")
+        self.assertEqual(payload["nextAction"]["tool"], "oa_begin_auth")
         self.assertEqual(payload["nextAction"]["arguments"]["baseUrl"], "https://example.invalid/oa/")
         self.assertEqual(payload["nextAction"]["arguments"]["session"], "work")
+        self.assertNotIn("password", json.dumps(payload, ensure_ascii=False).lower())
 
 
 class SensitiveOutputRegressionTest(unittest.TestCase):

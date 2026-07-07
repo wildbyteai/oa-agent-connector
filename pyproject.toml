@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oa-agent-connector"
-version = "0.2.4"
+version = "0.2.5"
 description = "Agent-side OA MCP connector using existing OA endpoints"
 requires-python = ">=3.9"
 dependencies = []
@@ -14,3 +14,4 @@ readme = "README.md"
 oa-agent = "oa_agent_connector.cli:main"
 oa-agent-mcp = "oa_agent_connector.mcp_server:main"
 oa-agent-mcp-config = "oa_agent_connector.config:main"
+oa-agent-local-auth = "oa_agent_connector.local_auth:main"

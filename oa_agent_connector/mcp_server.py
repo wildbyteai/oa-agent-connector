@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .client import OAClient, OAConnectorError
+from .local_auth import begin_local_auth, read_local_auth_status
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.4"
+SERVER_VERSION = "0.2.5"
 
 
 def _state_dir() -> Path:
@@ -24,6 +25,14 @@ def _state_dir() -> Path:
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".oa-agent-connector"
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _password_login_enabled() -> bool:
+    return _env_flag("OA_AGENT_ENABLE_PASSWORD_LOGIN")
 
 
 def _safe_session_name(name: str) -> str:
@@ -40,6 +49,14 @@ def _session_paths(session: str) -> Dict[str, Path]:
         "cookie": root / f"{safe}.cookies",
         "meta": root / f"{safe}.json",
     }
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
 
 
 def _saved_base_url(session: str) -> Optional[str]:
@@ -64,7 +81,7 @@ def _pending_path(token: str) -> Path:
 
 def _save_session(session: str, base_url: str) -> None:
     paths = _session_paths(session)
-    paths["root"].mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(paths["root"])
     paths["meta"].write_text(json.dumps({"baseUrl": base_url}, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         paths["meta"].chmod(0o600)
@@ -81,7 +98,7 @@ def _load_base_url(session: str, base_url: Optional[str]) -> str:
     saved_base = _saved_base_url(session)
     if saved_base:
         return saved_base
-    raise OAConnectorError("缺少 baseUrl：请先调用 oa_login，或传入 baseUrl/OA_BASE_URL")
+    raise OAConnectorError("缺少 baseUrl：请先配置 OA 地址，或传入 baseUrl/OA_BASE_URL")
 
 
 def _client(session: str, base_url: Optional[str] = None, insecure: bool = False) -> OAClient:
@@ -138,12 +155,10 @@ def _setup_guide(reason: str = "", session: str = "default") -> Dict[str, Any]:
     example_state_dir = os.getenv("OA_AGENT_STATE_DIR") or str(_state_dir())
     auth_required = _auth_required_reason(reason)
     base_url_configured = example_base_url != "<OA_BASE_URL>"
-    login_action = {
-        "tool": "oa_login",
+    auth_action = {
+        "tool": "oa_begin_auth",
         "arguments": {
             "baseUrl": example_base_url,
-            "username": "用户自己的 OA 账号",
-            "password": "用户自己的 OA 密码",
             "session": session,
         },
     }
@@ -153,7 +168,7 @@ def _setup_guide(reason: str = "", session: str = "default") -> Dict[str, Any]:
         "session": session,
         "configurationRequired": not base_url_configured,
         "reauthRequired": auth_required,
-        "nextAction": login_action if auth_required and base_url_configured else None,
+        "nextAction": auth_action if auth_required and base_url_configured else None,
         "guide": [
             {
                 "step": 1,
@@ -174,8 +189,8 @@ def _setup_guide(reason: str = "", session: str = "default") -> Dict[str, Any]:
             {
                 "step": 2,
                 "title": "授权登录",
-                "description": "调用 oa_login，使用用户自己的 OA 账号密码登录。密码不会保存，只保存登录 cookie。",
-                **login_action,
+                "description": "优先调用 oa_begin_auth 生成本机授权页面，让用户在本机页面输入 OA 账号密码。密码不会保存，只保存登录 cookie。",
+                **auth_action,
             },
             {
                 "step": 3,
@@ -242,7 +257,7 @@ def _save_pending_approval(data: Dict[str, Any]) -> str:
     data["createdAt"] = int(time.time())
     data["expiresAt"] = data["createdAt"] + 900
     pending_dir = _pending_dir()
-    pending_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(pending_dir)
     path = _pending_path(token)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
@@ -286,6 +301,20 @@ def _tool_schema(name: str, description: str, properties: Dict[str, Any], requir
     }
 
 
+PASSWORD_LOGIN_TOOL = _tool_schema(
+    "oa_login",
+    "兼容/调试登录工具。默认不向普通 Agent 暴露；普通用户必须优先使用 oa_begin_auth 本机授权页，避免在聊天里输入密码。",
+    {
+        "baseUrl": {"type": "string", "description": "OA 根地址，例如 https://example.com/oa/"},
+        "username": {"type": "string", "description": "OA 登录账号"},
+        "password": {"type": "string", "description": "OA 登录密码"},
+        "session": {"type": "string", "description": "本地会话名，默认 default"},
+        "insecure": {"type": "boolean", "description": "HTTPS 证书不校验，默认 false"},
+    },
+    ["baseUrl", "username", "password"],
+)
+
+
 TOOLS = [
     _tool_schema(
         "oa_setup_guide",
@@ -296,16 +325,22 @@ TOOLS = [
         },
     ),
     _tool_schema(
-        "oa_login",
-        "登录 OA 并保存当前用户会话 cookie。不会保存密码。",
+        "oa_begin_auth",
+        "启动只监听 127.0.0.1 的本机 OA 授权页面，返回可点击 authUrl。用户在本机页面输入账号密码，MCP 只保存登录 cookie，不保存密码。",
         {
-            "baseUrl": {"type": "string", "description": "OA 根地址，例如 https://example.com/oa/"},
-            "username": {"type": "string", "description": "OA 登录账号"},
-            "password": {"type": "string", "description": "OA 登录密码"},
+            "baseUrl": {"type": "string", "description": "OA 根地址；不传则使用已配置 OA_BASE_URL 或当前 session 保存的地址"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},
-            "insecure": {"type": "boolean", "description": "HTTPS 证书不校验，默认 false"},
+            "expiresInSeconds": {"type": "integer", "minimum": 60, "maximum": 1800, "default": 600},
+            "insecure": {"type": "boolean", "description": "HTTPS 证书不校验，默认 false；需要管理员设置 OA_AGENT_ALLOW_INSECURE_AUTH=1"},
         },
-        ["baseUrl", "username", "password"],
+    ),
+    _tool_schema(
+        "oa_local_auth_status",
+        "查询 oa_begin_auth 返回的本机授权页面状态，不触碰 OA 密码。",
+        {
+            "authToken": {"type": "string"},
+        },
+        ["authToken"],
     ),
     _tool_schema(
         "oa_auth_status",
@@ -487,6 +522,12 @@ TOOLS = [
 ]
 
 
+def _listed_tools() -> list[Dict[str, Any]]:
+    if _password_login_enabled():
+        return TOOLS + [PASSWORD_LOGIN_TOOL]
+    return TOOLS
+
+
 def _session(args: Dict[str, Any]) -> str:
     return str(args.get("session") or "default")
 
@@ -532,7 +573,23 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "oa_setup_guide":
         return _ok(_setup_guide(str(args.get("reason") or ""), session=session))
 
+    if name == "oa_begin_auth":
+        base_url = _load_base_url(session, args.get("baseUrl"))
+        result = begin_local_auth(
+            base_url=base_url,
+            session=session,
+            state_dir=str(_state_dir()),
+            insecure=insecure,
+            expires_in=int(args.get("expiresInSeconds") or 600),
+        )
+        return _ok(result)
+
+    if name == "oa_local_auth_status":
+        return _ok(read_local_auth_status(str(_state_dir()), str(args["authToken"])))
+
     if name == "oa_login":
+        if not _password_login_enabled():
+            raise OAConnectorError("oa_login 默认禁用。请使用 oa_begin_auth 生成本机授权页面，避免在聊天里输入 OA 密码")
         base_url = str(args["baseUrl"])
         client = OAClient(base_url, cookie_file=str(_session_paths(session)["cookie"]), verify_tls=not insecure)
         client.login(str(args["username"]), str(args["password"]))
@@ -743,7 +800,7 @@ def handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 },
             )
         if method == "tools/list":
-            return _response(message_id, {"tools": TOOLS})
+            return _response(message_id, {"tools": _listed_tools()})
         if method == "tools/call":
             tool_args = dict(params.get("arguments") or {})
             try:

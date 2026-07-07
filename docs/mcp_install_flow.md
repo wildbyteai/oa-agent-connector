@@ -4,7 +4,7 @@
 
 1. 新用户下载安装 MCP。
 2. 在 MCP 客户端中配置 `oa-agent-mcp`。
-3. 用户用自己的 OA 账号调用 `oa_login` 授权连接。
+3. Agent 调用 `oa_begin_auth` 生成本机授权链接，用户点击后在本机页面完成 OA 授权。
 4. 调用 `oa_list_todos` 查询当前登录账号有权限看到的待审批清单。
 5. 需要搜索 OA 文档时，调用只读搜索、详情和附件下载工具，仍然只基于当前登录账号权限。
 
@@ -81,14 +81,13 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 ## 第一次授权连接
 
-调用 MCP 工具 `oa_login`：
+优先调用 MCP 工具 `oa_begin_auth`：
 
 ```json
 {
   "baseUrl": "<OA_BASE_URL>",
-  "username": "用户自己的 OA 账号",
-  "password": "用户自己的 OA 密码",
-  "session": "default"
+  "session": "default",
+  "expiresInSeconds": 600
 }
 ```
 
@@ -97,12 +96,27 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 ```json
 {
   "ok": true,
+  "authRequired": true,
+  "authUrl": "http://127.0.0.1:<port>/authorize?state=<token>",
+  "authToken": "<token>",
   "session": "default",
   "baseUrl": "<OA_BASE_URL>"
 }
 ```
 
-密码不会保存。MCP 只保存登录后的 cookie、baseUrl 和待确认审批状态：
+Agent 把 `authUrl` 展示给用户点击。用户在本机页面输入 OA 账号和密码；密码不会进入聊天记录，也不会保存。授权页只监听 `127.0.0.1`，过期后需要重新发起。
+
+授权成功后，可调用 `oa_auth_status` 验证当前 session，也可以调用 `oa_local_auth_status` 查询本机授权页状态。
+
+`oa_login` 仍保留为兼容工具，但不作为普通用户默认授权方式。
+
+默认安全策略：
+
+- `oa_login` 默认不出现在 MCP 工具列表里；只有管理员显式设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时才开放。
+- `oa_begin_auth` 默认要求 OA 地址为 HTTPS，且不允许跳过证书校验。
+- 如果企业内网 OA 只能使用 HTTP，或必须跳过证书校验，需要管理员在 MCP 配置中显式设置 `OA_AGENT_ALLOW_INSECURE_AUTH=1`。
+
+MCP 只保存登录后的 cookie、baseUrl 和待确认审批状态：
 
 - 推荐目录：MCP 配置里的 `OA_AGENT_STATE_DIR`
 - cookie 文件权限会尽量设置为 `0600`
@@ -152,14 +166,14 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 1. 先调用 `oa_list_todos`。
 2. 如果成功，直接展示待办清单。
 3. 如果返回 `isError=true` 且内容里有 `guide`，把 guide 展示给用户。
-4. 如果 guide 提示未授权，向用户索取 OA 账号密码，调用 `oa_login`。
-5. `oa_login` 成功后，再调用 `oa_list_todos`。
+4. 如果 guide 提示未授权，调用 `oa_begin_auth`，把返回的本机授权链接展示给用户点击。
+5. 用户完成本机授权后，调用 `oa_auth_status` 或直接重试 `oa_list_todos`。
 
 注意边界：
 
 - 如果 MCP 客户端根本没有配置 `oa-agent-mcp`，这个 MCP 无法被调用，因此不能由 MCP 自己弹出引导；需要客户端安装页、插件市场说明或人工文档先完成 MCP 配置。
 - 一旦 MCP 已配置但缺少 `OA_BASE_URL`、没有登录 cookie、cookie 过期，`oa_list_todos` 会返回分步引导，不会只抛出裸错误，也不会擅自删除已有 cookie。
-- 如果返回里有 `reauthRequired=true` 和 `nextAction`，Agent 不需要询问“是否重新授权”，应直接按 `nextAction` 发起重新授权：使用已配置 OA 地址和原 session，只向用户索取 OA 账号和密码，然后调用 `oa_login`。
+- 如果返回里有 `reauthRequired=true` 和 `nextAction`，Agent 不需要询问“是否重新授权”，应直接按 `nextAction` 发起本机授权，把返回的授权链接给用户点击。
 - 如果返回里有 `configurationRequired=true`，说明连接器还不知道 OA 地址。Agent 应先让用户提供 OA 地址，重新生成 MCP 配置，再继续授权。
 
 可主动调用 `oa_setup_guide` 获取同一套引导：
@@ -208,7 +222,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 ## 权限边界
 
-- 必须先 `oa_login`，后续查询使用该登录 cookie。
+- 必须先完成 OA 授权，后续查询使用该登录 cookie。
 - `oa_list_todos` 只返回 OA 现有接口对当前登录账号可见的数据。
 - `oa_get_detail` 默认要求 `fdId` 必须在当前登录账号待办清单中。
 - `oa_search_objects`、`oa_get_object_detail`、`oa_download_attachment` 只做当前账号权限内的只读搜索、详情查看和附件下载。
@@ -278,8 +292,10 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 ## 可用工具
 
-- `oa_login`：登录授权，保存 cookie。
 - `oa_setup_guide`：返回配置、授权、查询的分步引导。
+- `oa_begin_auth`：启动本机授权页面，返回可点击授权链接。
+- `oa_local_auth_status`：查询本机授权页面状态。
+- `oa_login`：兼容登录工具，保存 cookie，不保存密码；默认不暴露，只有设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时才会出现在工具列表里。
 - `oa_auth_status`：检查当前 session 是否仍有效。
 - `oa_list_todos`：查询当前登录账号待办清单。
 - `oa_get_detail`：查看待审批单据详情。
