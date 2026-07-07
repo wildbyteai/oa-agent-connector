@@ -13,11 +13,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .client import OAClient, OAConnectorError
-from .local_auth import begin_local_auth, read_local_auth_status
+from .local_auth import begin_local_auth, read_local_auth_status, transport_security_issue
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.5"
+SERVER_VERSION = "0.2.6"
 
 
 def _state_dir() -> Path:
@@ -59,14 +59,19 @@ def _ensure_private_dir(path: Path) -> None:
         pass
 
 
-def _saved_base_url(session: str) -> Optional[str]:
+def _saved_session_meta(session: str) -> Dict[str, Any]:
     meta = _session_paths(session)["meta"]
     if not meta.exists():
-        return None
+        return {}
     try:
-        value = json.loads(meta.read_text(encoding="utf-8")).get("baseUrl")
+        value = json.loads(meta.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
-        return None
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _saved_base_url(session: str) -> Optional[str]:
+    value = _saved_session_meta(session).get("baseUrl")
     return str(value) if value else None
 
 
@@ -79,10 +84,23 @@ def _pending_path(token: str) -> Path:
     return _pending_dir() / f"{safe}.json"
 
 
-def _save_session(session: str, base_url: str) -> None:
+def _transport_confirmation_dir() -> Path:
+    return _state_dir() / "transport-confirmations"
+
+
+def _transport_confirmation_path(token: str) -> Path:
+    safe = "".join(ch for ch in token if ch.isalnum() or ch in ("-", "_"))
+    return _transport_confirmation_dir() / f"{safe}.json"
+
+
+def _save_session(session: str, base_url: str, login_account: str = "") -> None:
     paths = _session_paths(session)
     _ensure_private_dir(paths["root"])
-    paths["meta"].write_text(json.dumps({"baseUrl": base_url}, ensure_ascii=False, indent=2), encoding="utf-8")
+    data = _saved_session_meta(session)
+    data["baseUrl"] = base_url
+    if login_account:
+        data["loginAccount"] = login_account
+    paths["meta"].write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         paths["meta"].chmod(0o600)
     except OSError:
@@ -101,8 +119,15 @@ def _load_base_url(session: str, base_url: Optional[str]) -> str:
     raise OAConnectorError("缺少 baseUrl：请先配置 OA 地址，或传入 baseUrl/OA_BASE_URL")
 
 
+def _reject_https_tls_skip_without_admin(base_url: str, insecure: bool) -> None:
+    scheme = urllib.parse.urlparse(str(base_url)).scheme.lower()
+    if scheme == "https" and insecure and not _env_flag("OA_AGENT_ALLOW_INSECURE_AUTH"):
+        raise OAConnectorError("HTTPS 证书校验不能跳过；如确需跳过，请由管理员显式设置 OA_AGENT_ALLOW_INSECURE_AUTH=1")
+
+
 def _client(session: str, base_url: Optional[str] = None, insecure: bool = False) -> OAClient:
     resolved_base_url = _load_base_url(session, base_url)
+    _reject_https_tls_skip_without_admin(resolved_base_url, insecure)
     paths = _session_paths(session)
     return OAClient(
         resolved_base_url,
@@ -267,6 +292,43 @@ def _save_pending_approval(data: Dict[str, Any]) -> str:
     return token
 
 
+def _save_transport_confirmation(session: str, base_url: str, expires_in: int) -> Dict[str, Any]:
+    token = secrets.token_urlsafe(24)
+    data = {
+        "token": token,
+        "session": session,
+        "baseUrl": base_url,
+        "expiresAt": int(time.time()) + max(60, min(int(expires_in), 1800)),
+    }
+    path = _transport_confirmation_path(token)
+    _ensure_private_dir(path.parent)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return data
+
+
+def _consume_transport_confirmation(token: str, session: str, base_url: str) -> bool:
+    if not token:
+        return False
+    path = _transport_confirmation_path(token)
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if int(data.get("expiresAt") or 0) < int(time.time()):
+        return False
+    return data.get("session") == session and data.get("baseUrl") == base_url
+
+
 def _load_pending_approval(token: str) -> Dict[str, Any]:
     path = _pending_path(token)
     if not path.exists():
@@ -309,7 +371,7 @@ PASSWORD_LOGIN_TOOL = _tool_schema(
         "username": {"type": "string", "description": "OA 登录账号"},
         "password": {"type": "string", "description": "OA 登录密码"},
         "session": {"type": "string", "description": "本地会话名，默认 default"},
-        "insecure": {"type": "boolean", "description": "HTTPS 证书不校验，默认 false"},
+        "insecure": {"type": "boolean", "description": "HTTPS 证书不校验，默认 false；仅管理员批准后使用"},
     },
     ["baseUrl", "username", "password"],
 )
@@ -331,7 +393,8 @@ TOOLS = [
             "baseUrl": {"type": "string", "description": "OA 根地址；不传则使用已配置 OA_BASE_URL 或当前 session 保存的地址"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},
             "expiresInSeconds": {"type": "integer", "minimum": 60, "maximum": 1800, "default": 600},
-            "insecure": {"type": "boolean", "description": "HTTPS 证书不校验，默认 false；需要管理员设置 OA_AGENT_ALLOW_INSECURE_AUTH=1"},
+            "insecure": {"type": "boolean", "description": "用户确认后允许通过 HTTP 内网 OA 授权；HTTPS 跳过证书校验仍需管理员批准"},
+            "transportConfirmationToken": {"type": "string", "description": "MCP 返回的 HTTP 安全确认令牌；只有用户确认后才能按 nextAction 传入"},
         },
     ),
     _tool_schema(
@@ -344,7 +407,7 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_auth_status",
-        "检查指定会话是否仍可访问 OA 待办数据源。",
+        "检查指定会话是否仍可访问 OA 待办数据源，并尽量返回当前登录身份 loginAs。",
         {
             "baseUrl": {"type": "string"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},
@@ -534,7 +597,9 @@ def _session(args: Dict[str, Any]) -> str:
 
 def _bool(args: Dict[str, Any], key: str, default: bool = False) -> bool:
     value = args.get(key, default)
-    return bool(value)
+    if isinstance(value, bool):
+        return value
+    raise OAConnectorError(f"参数 {key} 必须是布尔值 true 或 false")
 
 
 
@@ -565,6 +630,34 @@ def _reject_bypass_params(tool_name: str, args: Dict[str, Any]) -> None:
         )
 
 
+def _http_transport_confirmation_error(session: str, base_url: str, expires_in: int) -> Dict[str, Any]:
+    confirmation = _save_transport_confirmation(session, base_url, expires_in)
+    return _mcp_error(
+        {
+            "ok": False,
+            "transportSecurityRequired": True,
+            "reason": "当前 OA 地址使用 HTTP。继续授权时，OA 账号和密码会通过非 HTTPS 连接发送。",
+            "code": "httpBaseUrl",
+            "session": session,
+            "baseUrl": base_url,
+            "confirmationText": "确认使用不安全连接授权",
+            "transportConfirmationToken": confirmation["token"],
+            "confirmationExpiresAt": confirmation["expiresAt"],
+            "nextAction": {
+                "tool": "oa_begin_auth",
+                "arguments": {
+                    "baseUrl": base_url,
+                    "session": session,
+                    "expiresInSeconds": expires_in,
+                    "insecure": True,
+                    "transportConfirmationToken": confirmation["token"],
+                },
+            },
+            "userMessage": "当前 OA 地址不是 HTTPS。请确认这是公司可信内网地址；确认后我会继续打开本机授权页。",
+        }
+    )
+
+
 
 def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     session = _session(args)
@@ -575,12 +668,37 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
 
     if name == "oa_begin_auth":
         base_url = _load_base_url(session, args.get("baseUrl"))
+        expires_in = int(args.get("expiresInSeconds") or 600)
+        scheme = urllib.parse.urlparse(str(base_url)).scheme.lower()
+        if scheme == "http" and not _env_flag("OA_AGENT_ALLOW_INSECURE_AUTH"):
+            if not insecure:
+                return _http_transport_confirmation_error(session, base_url, expires_in)
+            confirmation_token = str(args.get("transportConfirmationToken") or "")
+            if not _consume_transport_confirmation(confirmation_token, session, base_url):
+                return _http_transport_confirmation_error(session, base_url, expires_in)
+        security_issue = transport_security_issue(base_url, insecure)
+        if security_issue:
+            payload: Dict[str, Any] = {
+                "ok": False,
+                "transportSecurityRequired": False,
+                "reason": security_issue["message"],
+                "code": security_issue["code"],
+                "session": session,
+                "baseUrl": base_url,
+            }
+            if security_issue["code"] == "tlsVerificationDisabled":
+                payload["adminApprovalRequired"] = True
+                payload["userMessage"] = "当前 HTTPS 连接请求跳过证书校验。请使用可信证书，或由管理员显式批准后再继续。"
+            else:
+                payload["configurationRequired"] = True
+                payload["userMessage"] = "OA 地址格式不正确。请提供以 https:// 或 http:// 开头的 OA 地址。"
+            return _mcp_error(payload)
         result = begin_local_auth(
             base_url=base_url,
             session=session,
             state_dir=str(_state_dir()),
             insecure=insecure,
-            expires_in=int(args.get("expiresInSeconds") or 600),
+            expires_in=expires_in,
         )
         return _ok(result)
 
@@ -591,9 +709,10 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if not _password_login_enabled():
             raise OAConnectorError("oa_login 默认禁用。请使用 oa_begin_auth 生成本机授权页面，避免在聊天里输入 OA 密码")
         base_url = str(args["baseUrl"])
+        _reject_https_tls_skip_without_admin(base_url, insecure)
         client = OAClient(base_url, cookie_file=str(_session_paths(session)["cookie"]), verify_tls=not insecure)
         client.login(str(args["username"]), str(args["password"]))
-        _save_session(session, base_url)
+        _save_session(session, base_url, login_account=str(args["username"]))
         return _ok({"ok": True, "session": session, "baseUrl": base_url})
 
     if name == "oa_confirm_approval":
@@ -685,8 +804,19 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     client = _client(session=session, base_url=args.get("baseUrl"), insecure=insecure)
 
     if name == "oa_auth_status":
-        client.assert_logged_in()
-        return _ok({"ok": True, "session": session, "baseUrl": client.base_url})
+        if hasattr(client, "auth_status"):
+            status = client.auth_status()
+        else:
+            client.assert_logged_in()
+            status = {"ok": True}
+        status["session"] = session
+        status["baseUrl"] = client.base_url
+        meta = _saved_session_meta(session)
+        if not status.get("loginAs") and meta.get("loginAccount"):
+            status["loginAs"] = str(meta["loginAccount"])
+            status["identityAvailable"] = True
+            status["identitySource"] = "savedLoginAccount"
+        return _ok(status)
     if name == "oa_list_todos":
         page = int(args.get("page") or 1)
         page_size = int(args.get("pageSize") or 20)

@@ -48,7 +48,7 @@ MCP 模式建议始终配置 `OA_AGENT_STATE_DIR` 为目标电脑上的真实绝
 oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 ```
 
-MCP 普通授权默认使用 `oa_begin_auth` 本机授权页。`oa_login` 默认不暴露给普通 Agent；只有管理员显式设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时才开放。`oa_begin_auth` 默认要求 OA 地址为 HTTPS；如果企业内网 OA 只能 HTTP，需要管理员显式设置 `OA_AGENT_ALLOW_INSECURE_AUTH=1`。
+MCP 普通授权默认使用 `oa_begin_auth` 本机授权页。`oa_login` 默认不暴露给普通 Agent；只有管理员显式设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时才开放。`oa_begin_auth` 默认优先要求 OA 地址为 HTTPS；如果企业内网 OA 只能 HTTP，MCP 会先返回安全确认提示、一次性确认令牌和 `nextAction`，用户确认后 Agent 再调用 `oa_begin_auth(insecure=true)` 继续授权，不需要用户手动改配置或重启。HTTPS 跳过证书校验不走普通用户确认流程，仍需管理员显式设置 `OA_AGENT_ALLOW_INSECURE_AUTH=1`。该环境变量仅作为管理员预先批准可信内网 HTTP 或 HTTPS 跳过证书校验的全局例外。
 
 ## Agent 工具封装建议
 

@@ -68,6 +68,65 @@ class OAClientTest(unittest.TestCase):
         self.assertEqual(todos[0].fd_id, "1234567890abcdef1234567890abcdef")
         self.assertEqual(todos[0].subject, "采购审批")
 
+    def test_auth_status_extracts_login_identity_from_json(self):
+        payload = {
+            "currentUser": {
+                "currentUserName": "姚斐",
+                "deptName": "技术部",
+                "postName": "技术经理",
+            }
+        }
+        client = FakeOAClient(json.dumps(payload, ensure_ascii=False))
+        status = client.auth_status()
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["loginAs"], "姚斐/技术经理")
+        self.assertTrue(status["identityAvailable"])
+        self.assertEqual(status["identity"]["department"], "技术部")
+
+    def test_auth_status_extracts_login_identity_from_html(self):
+        client = FakeOAClient("<html><body>当前用户：姚斐</body></html>")
+        status = client.auth_status()
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["loginAs"], "姚斐")
+
+    def test_auth_status_does_not_treat_business_row_as_login_identity(self):
+        payload = {
+            "rows": [
+                {
+                    "userName": "示例申请人",
+                    "fdLoginName": "applicant001",
+                    "account": "applicant001",
+                    "userNo": "applicant001",
+                    "deptName": "示例部门",
+                    "subject": "请假申请",
+                }
+            ]
+        }
+        client = FakeOAClient(json.dumps(payload, ensure_ascii=False))
+        status = client.auth_status()
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["loginAs"], "")
+        self.assertFalse(status["identityAvailable"])
+
+    def test_auth_status_skips_business_rows_before_current_user(self):
+        payload = {
+            "rows": [
+                {
+                    "fdLoginName": "applicant001",
+                    "account": "applicant001",
+                    "deptName": "申请部门",
+                }
+            ],
+            "currentUser": {
+                "loginName": "u001",
+                "fdUserName": "姚斐",
+                "postName": "技术经理",
+            },
+        }
+        client = FakeOAClient(json.dumps(payload, ensure_ascii=False))
+        status = client.auth_status()
+        self.assertEqual(status["loginAs"], "姚斐/技术经理")
+
     def test_approval_dry_run_requires_current_todo(self):
         client = FakeOAClient(json.dumps({"rows": [{"fdId": "1234567890abcdef1234567890abcdef"}]}))
         result = client.approve("1234567890abcdef1234567890abcdef", "同意")

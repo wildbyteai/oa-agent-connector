@@ -323,6 +323,21 @@ class OAClient:
         if self._looks_like_login_page(response["url"], response["text"]):
             raise OAConnectorError("当前 cookie 未登录或已失效，请先 login")
 
+    def auth_status(self) -> Dict[str, Any]:
+        response = self._request(
+            "km/review/km_review_index/kmReviewIndex.do",
+            params={"method": "list", "j_path": "/listApproval", "mydoc": "approval", "q.mydoc": "approval"},
+        )
+        if self._looks_like_login_page(response["url"], response["text"]):
+            raise OAConnectorError("当前 cookie 未登录或已失效，请先 login")
+        identity = self._extract_login_identity(response["text"])
+        return {
+            "ok": True,
+            "loginAs": identity.get("loginAs", ""),
+            "identityAvailable": bool(identity.get("loginAs")),
+            "identity": identity,
+        }
+
     def list_todos(self, page: int = 1, page_size: int = 20) -> List[OATodo]:
         response = self._request(
             "km/review/km_review_index/kmReviewIndex.do",
@@ -1081,6 +1096,89 @@ class OAClient:
             return json.loads(text)
         except json.JSONDecodeError:
             return None
+
+    def _extract_login_identity(self, text: str) -> Dict[str, str]:
+        parsed = self._try_json(text.lstrip("\ufeff\r\n\t "))
+        if parsed is not None:
+            identity = self._find_identity(parsed)
+            if identity:
+                return identity
+
+        patterns = (
+            (r'(?i)\bloginUserName\b\s*[:=]\s*["\']([^"\']{1,80})["\']', "userName"),
+            (r'(?i)\bcurrentUserName\b\s*[:=]\s*["\']([^"\']{1,80})["\']', "userName"),
+            (r"当前用户\s*[:：]\s*([^<\s]{1,80})", "userName"),
+            (r"登录用户\s*[:：]\s*([^<\s]{1,80})", "userName"),
+        )
+        data: Dict[str, str] = {}
+        for pattern, key in patterns:
+            match = re.search(pattern, text[:10000])
+            if match:
+                data[key] = self._strip_html(match.group(1))
+                break
+        return self._identity_payload(data)
+
+    def _find_identity(self, node: Any, context: str = "") -> Dict[str, str]:
+        if isinstance(node, dict):
+            data = self._identity_from_dict(node, context=context)
+            if data:
+                return data
+            for key, value in node.items():
+                data = self._find_identity(value, context=str(key))
+                if data:
+                    return data
+        return {}
+
+    def _identity_from_dict(self, node: Dict[str, Any], context: str = "") -> Dict[str, str]:
+        lowered = {str(key).lower(): value for key, value in node.items()}
+        context_lower = context.lower()
+
+        def pick(*keys: str) -> str:
+            for key in keys:
+                value = lowered.get(key.lower())
+                if isinstance(value, (str, int)):
+                    text = self._strip_html(str(value))
+                    if 0 < len(text) <= 80:
+                        return text
+            return ""
+
+        strong_user_name = pick("currentUserName", "loginUserName")
+        department = pick("currentDeptName", "deptName", "departmentName", "fdDeptName", "orgName")
+        position = pick("postName", "positionName", "jobTitle")
+        has_login_context = any(part in context_lower for part in ("currentuser", "loginuser", "sessionuser", "current_user", "login_user"))
+        user_name = strong_user_name
+        if not user_name and has_login_context:
+            user_name = pick("fdUserName", "personName", "fdName", "userName", "name", "loginName", "fdLoginName")
+        account = pick("account", "loginAccount", "userNo", "employeeNo") if has_login_context else ""
+
+        if not (user_name or account):
+            return {}
+        return self._identity_payload(
+            {
+                "userName": user_name,
+                "department": department,
+                "position": position,
+                "account": account,
+            }
+        )
+
+    def _identity_payload(self, data: Dict[str, str]) -> Dict[str, str]:
+        user_name = self._strip_html(data.get("userName", ""))
+        department = self._strip_html(data.get("department", ""))
+        position = self._strip_html(data.get("position", ""))
+        account = self._strip_html(data.get("account", ""))
+        role = position or department
+        login_as = user_name or account
+        if login_as and role:
+            login_as = f"{login_as}/{role}"
+        return {
+            "loginAs": login_as,
+            "userName": user_name,
+            "department": department,
+            "position": position,
+            "account": account,
+            "identitySource": "oaResponse" if login_as else "",
+        }
 
     def _find_rows(self, node: Any) -> List[Dict[str, Any]]:
         if isinstance(node, list):

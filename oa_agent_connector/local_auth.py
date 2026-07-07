@@ -36,11 +36,32 @@ def _allow_insecure_auth() -> bool:
     return _env_flag("OA_AGENT_ALLOW_INSECURE_AUTH")
 
 
-def _validate_auth_transport(base_url: str, insecure: bool) -> None:
+def transport_security_issue(base_url: str, insecure: bool = False) -> Optional[Dict[str, str]]:
     scheme = urllib.parse.urlparse(str(base_url)).scheme.lower()
-    if scheme != "https" or insecure:
-        if not _allow_insecure_auth():
-            raise ValueError("本机授权默认要求 HTTPS OA 地址且不允许跳过证书校验；如确需 HTTP/跳过校验，请由管理员显式设置 OA_AGENT_ALLOW_INSECURE_AUTH=1")
+    if scheme == "https":
+        if insecure and not _allow_insecure_auth():
+            return {
+                "code": "tlsVerificationDisabled",
+                "message": "当前 OA 地址使用 HTTPS，但请求跳过证书校验。跳过证书校验需要管理员显式批准。",
+            }
+        return None
+    if scheme == "http" and (insecure or _allow_insecure_auth()):
+        return None
+    if scheme == "http":
+        return {
+            "code": "httpBaseUrl",
+            "message": "当前 OA 地址使用 HTTP。继续授权时，OA 账号和密码会通过非 HTTPS 连接发送。",
+        }
+    return {
+        "code": "unsupportedScheme",
+        "message": "当前 OA 地址不是 HTTPS。继续授权前需要确认连接方式是否可信。",
+    }
+
+
+def _validate_auth_transport(base_url: str, insecure: bool) -> None:
+    issue = transport_security_issue(base_url, insecure)
+    if issue:
+        raise ValueError(issue["message"])
 
 
 def _reserve_loopback_port() -> int:
@@ -86,10 +107,13 @@ def _ensure_private_dir(path: Path) -> None:
         pass
 
 
-def _save_session(state_dir: str, session: str, base_url: str) -> None:
+def _save_session(state_dir: str, session: str, base_url: str, login_account: str = "") -> None:
     paths = _session_paths(state_dir, session)
     _ensure_private_dir(paths["root"])
-    paths["meta"].write_text(json.dumps({"baseUrl": base_url}, ensure_ascii=False, indent=2), encoding="utf-8")
+    data: Dict[str, Any] = {"baseUrl": base_url}
+    if login_account:
+        data["loginAccount"] = login_account
+    paths["meta"].write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         paths["meta"].chmod(0o600)
     except OSError:
@@ -139,6 +163,9 @@ def read_local_auth_status(state_dir: str, token: str) -> Dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"ok": False, "status": "unreadable", "authToken": token}
+    if isinstance(data, dict):
+        data = dict(data)
+        data.pop("loginAccount", None)
     if data.get("status") == "pending" and int(data.get("expiresAt") or 0) < int(time.time()):
         data = dict(data)
         data["status"] = "expired"
@@ -213,11 +240,16 @@ def _html_page(title: str, body: str) -> bytes:
     return page.encode("utf-8")
 
 
-def _form_html(base_url: str, session: str, token: str, error: str = "") -> bytes:
+def _form_html(base_url: str, session: str, token: str, error: str = "", insecure: bool = False) -> bytes:
     error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    scheme = urllib.parse.urlparse(str(base_url)).scheme.lower()
+    warning_html = ""
+    if scheme == "http" and insecure:
+        warning_html = '<p class="error">当前 OA 地址不是 HTTPS。请确认这是公司可信内网地址后再输入账号密码。</p>'
     body = f"""
 <h1>OA 授权登录</h1>
 <p class="muted">请在本机页面输入 OA 账号和密码。密码只用于本次登录，不会保存，也不会写入聊天记录。若浏览器询问是否保存密码，请选择不保存。</p>
+{warning_html}
 {error_html}
 <form method="post" action="/authorize" autocomplete="off">
   <input type="hidden" name="state" value="{html.escape(token)}">
@@ -284,7 +316,7 @@ def serve_local_auth(
             if int(time.time()) > expires_at:
                 self._send(410, _message_html("授权已过期", "请回到 Agent 重新发起 OA 授权。"))
                 return
-            self._send(200, _form_html(base_url, session, token))
+            self._send(200, _form_html(base_url, session, token, insecure=insecure))
 
         def do_POST(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
@@ -309,12 +341,12 @@ def serve_local_auth(
             username = (form.get("username") or [""])[0].strip()
             password = (form.get("password") or [""])[0]
             if not username or not password:
-                self._send(400, _form_html(base_url, session, token, "请填写 OA 账号和密码。"))
+                self._send(400, _form_html(base_url, session, token, "请填写 OA 账号和密码。", insecure=insecure))
                 return
             try:
                 client = client_factory(base_url, cookie_file=str(paths["cookie"]), verify_tls=not insecure)
                 client.login(username, password)
-                _save_session(state_dir, session, base_url)
+                _save_session(state_dir, session, base_url, login_account=username)
                 _write_json(
                     status_path,
                     {
@@ -343,7 +375,7 @@ def serve_local_auth(
                         "updatedAt": int(time.time()),
                     },
                 )
-                self._send(400, _form_html(base_url, session, token, "登录失败，请检查账号或密码后重试。"))
+                self._send(400, _form_html(base_url, session, token, "登录失败，请检查账号或密码后重试。", insecure=insecure))
 
     httpd = ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
     httpd.timeout = 1

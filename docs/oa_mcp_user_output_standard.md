@@ -123,6 +123,7 @@ Agent 输出：
 Agent 行为：
 
 - 如果 MCP 返回 `reauthRequired=true` 且带有 `nextAction`，直接按 `nextAction` 调用 `oa_begin_auth`，不要问用户是否重新授权。
+- 如果 MCP 返回 `transportSecurityRequired=true` 且带有 `nextAction`，先要求用户确认安全例外；用户回复固定确认词后，再按 `nextAction` 调用 `oa_begin_auth`。不要向用户展示确认令牌。
 - 把 `oa_begin_auth` 返回的本机授权链接展示给用户点击。
 - 不要要求用户在聊天里发送 OA 密码。
 - 重新登录成功后，自动继续执行用户刚才的查询或操作。
@@ -135,12 +136,30 @@ cookie 过期
 401 Unauthorized
 ```
 
-如果无法生成本机授权链接，且原因是 OA 地址不是 HTTPS 或证书校验不通过，Agent 输出：
+如果 OA 地址不是 HTTPS，MCP 返回了安全确认提示，Agent 输出：
 
 ```text
-当前 OA 授权链接暂时无法生成。
+当前 OA 地址不是 HTTPS。请确认这是公司可信内网地址。
 
-这台电脑的 OA 连接需要管理员确认安全配置后才能继续。请联系管理员处理。
+确认后请回复：确认使用不安全连接授权
+```
+
+用户回复“确认使用不安全连接授权”后，Agent 才能继续生成本机授权链接。不要让用户手动修改 MCP 配置或重启。
+
+如果 MCP 提示 HTTPS 证书校验不能跳过，Agent 输出：
+
+```text
+当前 OA 的 HTTPS 证书校验不能跳过。
+
+请使用公司可信的 OA 地址，或联系管理员处理证书配置。
+```
+
+如果 OA 地址格式不是 `http://` 或 `https://` 开头，Agent 输出：
+
+```text
+当前 OA 地址格式不正确。
+
+请提供以 http:// 或 https:// 开头的 OA 地址。
 ```
 
 ## 场景 6：用户选择某条待办看详情

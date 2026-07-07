@@ -220,7 +220,7 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(calls["state_dir"], tmpdir)
         self.assertEqual(calls["expires_in"], 120)
 
-    def test_begin_auth_rejects_http_without_admin_opt_in(self):
+    def test_begin_auth_http_returns_dynamic_insecure_next_action(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(
                 "os.environ",
@@ -237,15 +237,131 @@ class MCPServerTest(unittest.TestCase):
                 )
         self.assertTrue(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
-        self.assertIn("HTTPS", payload["reason"])
+        self.assertTrue(payload["transportSecurityRequired"])
+        self.assertEqual(payload["nextAction"]["tool"], "oa_begin_auth")
+        self.assertTrue(payload["nextAction"]["arguments"]["insecure"])
+        self.assertEqual(payload["nextAction"]["arguments"]["baseUrl"], "http://example.invalid/oa/")
+        self.assertIn("transportConfirmationToken", payload)
+        self.assertEqual(payload["nextAction"]["arguments"]["transportConfirmationToken"], payload["transportConfirmationToken"])
+        self.assertEqual(payload["confirmationText"], "确认使用不安全连接授权")
         self.assertNotIn("authUrl", payload)
+
+    def test_begin_auth_http_dynamic_insecure_override_requires_confirmation_token(self):
+        calls = {}
+
+        def fake_begin_local_auth(**kwargs):
+            calls.update(kwargs)
+            return {
+                "ok": True,
+                "authRequired": True,
+                "authUrl": "http://127.0.0.1:12345/authorize?state=abc",
+                "authToken": "abc",
+                "session": kwargs["session"],
+                "baseUrl": kwargs["base_url"],
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://example.invalid/oa/"}, clear=False):
+                with patch.object(mcp_server, "begin_local_auth", fake_begin_local_auth):
+                    first = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "oa_begin_auth", "arguments": {"session": "work"}},
+                        }
+                    )
+                    first_payload = json.loads(first["result"]["content"][0]["text"])
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {"name": "oa_begin_auth", "arguments": first_payload["nextAction"]["arguments"]},
+                        }
+                    )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["authUrl"], "http://127.0.0.1:12345/authorize?state=abc")
+        self.assertEqual(calls["base_url"], "http://example.invalid/oa/")
+        self.assertTrue(calls["insecure"])
+        self.assertEqual(calls["session"], "work")
+
+    def test_begin_auth_http_insecure_without_confirmation_token_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://example.invalid/oa/"}, clear=False):
+                response = mcp_server.handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_begin_auth", "arguments": {"session": "work", "insecure": True}},
+                    }
+                )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(response["result"]["isError"])
+        self.assertTrue(payload["transportSecurityRequired"])
+        self.assertNotIn("authUrl", payload)
+        self.assertIn("transportConfirmationToken", payload)
+
+    def test_begin_auth_rejects_insecure_string_value(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "http://example.invalid/oa/"}, clear=False):
+                response = mcp_server.handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_begin_auth", "arguments": {"session": "work", "insecure": "false"}},
+                    }
+                )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("必须是布尔值", payload["reason"])
+
+    def test_begin_auth_https_insecure_requires_admin_exception(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/", "OA_AGENT_ALLOW_INSECURE_AUTH": ""},
+                clear=False,
+            ):
+                response = mcp_server.handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_begin_auth", "arguments": {"session": "work", "insecure": True}},
+                    }
+                )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(response["result"]["isError"])
+        self.assertTrue(payload["adminApprovalRequired"])
+        self.assertEqual(payload["code"], "tlsVerificationDisabled")
+        self.assertNotIn("nextAction", payload)
+
+    def test_begin_auth_rejects_unsupported_scheme_without_next_action(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "ftp://example.invalid/oa/"}, clear=False):
+                response = mcp_server.handle(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_begin_auth", "arguments": {"session": "work", "insecure": True}},
+                    }
+                )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(response["result"]["isError"])
+        self.assertTrue(payload["configurationRequired"])
+        self.assertFalse(payload["transportSecurityRequired"])
+        self.assertNotIn("nextAction", payload)
 
     def test_local_auth_status_reads_status_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             status_dir = Path(tmpdir) / "local-auth"
             status_dir.mkdir()
             (status_dir / "abc.json").write_text(
-                json.dumps({"ok": True, "status": "success", "authToken": "abc"}, ensure_ascii=False),
+                json.dumps({"ok": True, "status": "success", "authToken": "abc", "loginAccount": "u001"}, ensure_ascii=False),
                 encoding="utf-8",
             )
             with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
@@ -259,6 +375,66 @@ class MCPServerTest(unittest.TestCase):
                 )
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["status"], "success")
+        self.assertNotIn("loginAccount", payload)
+
+    def test_auth_status_returns_login_identity_from_client(self):
+        class IdentityClient(FakeClient):
+            def auth_status(self):
+                return {
+                    "ok": True,
+                    "loginAs": "姚斐/技术经理",
+                    "identityAvailable": True,
+                    "identity": {"userName": "姚斐", "position": "技术经理"},
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", IdentityClient):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "oa_auth_status", "arguments": {"session": "work"}},
+                        }
+                    )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["loginAs"], "姚斐/技术经理")
+        self.assertEqual(payload["session"], "work")
+
+    def test_auth_status_falls_back_to_saved_login_account(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_AGENT_ENABLE_PASSWORD_LOGIN": "1"}, clear=False):
+                with patch.object(mcp_server, "OAClient", FakeClient):
+                    mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_login",
+                                "arguments": {
+                                    "baseUrl": "https://example.invalid/oa/",
+                                    "username": "u001",
+                                    "password": "p",
+                                    "session": "work",
+                                },
+                            },
+                        }
+                    )
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {"name": "oa_auth_status", "arguments": {"session": "work"}},
+                        }
+                    )
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["loginAs"], "u001")
+        self.assertEqual(payload["identitySource"], "savedLoginAccount")
 
     def test_prepare_then_confirm_approval(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -92,6 +92,7 @@ class LocalAuthTest(unittest.TestCase):
             final_status = json.loads(status_file.read_text(encoding="utf-8"))
             self.assertEqual(final_status["status"], "success")
             self.assertEqual(final_status["session"], "work")
+            self.assertNotIn("loginAccount", final_status)
             self.assertEqual(seen["username"], "u001")
             self.assertEqual(seen["password"], "secret-password")
             self.assertEqual(seen["base_url"], "https://example.invalid/oa/")
@@ -207,6 +208,68 @@ class LocalAuthTest(unittest.TestCase):
                         session="work",
                         state_dir=tmpdir,
                     )
+        self.assertIn("HTTPS", str(ctx.exception))
+
+    def test_begin_auth_rejects_https_insecure_without_admin_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_ALLOW_INSECURE_AUTH": ""}, clear=False):
+                with self.assertRaises(ValueError) as ctx:
+                    local_auth.begin_local_auth(
+                        base_url="https://example.invalid/oa/",
+                        session="work",
+                        state_dir=tmpdir,
+                        insecure=True,
+                    )
+        self.assertIn("证书校验", str(ctx.exception))
+
+    def test_http_local_auth_form_shows_transport_warning(self):
+        html = local_auth._form_html("http://example.invalid/oa/", "work", "token", insecure=True).decode("utf-8")
+        self.assertIn("当前 OA 地址不是 HTTPS", html)
+        self.assertIn("可信内网地址", html)
+
+    def test_begin_auth_allows_http_with_dynamic_insecure_override(self):
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return FakeProcess()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(local_auth.secrets, "token_urlsafe", return_value="token-123"):
+                with patch.object(local_auth, "_reserve_loopback_port", return_value=12345):
+                    with patch.object(local_auth.subprocess, "Popen", side_effect=fake_popen):
+                        with patch.object(
+                            local_auth,
+                            "read_local_auth_status",
+                            return_value={
+                                "ok": False,
+                                "status": "pending",
+                                "authUrl": "http://127.0.0.1:12345/authorize?state=token-123",
+                                "expiresAt": 123,
+                            },
+                        ):
+                            result = local_auth.begin_local_auth(
+                                base_url="http://example.invalid/oa/",
+                                session="work",
+                                state_dir=tmpdir,
+                                insecure=True,
+                            )
+        self.assertEqual(result["authUrl"], "http://127.0.0.1:12345/authorize?state=token-123")
+        self.assertIn("--insecure", captured["cmd"])
+
+    def test_begin_auth_rejects_unsupported_scheme_even_with_insecure_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(ValueError) as ctx:
+                local_auth.begin_local_auth(
+                    base_url="ftp://example.invalid/oa/",
+                    session="work",
+                    state_dir=tmpdir,
+                    insecure=True,
+                )
         self.assertIn("HTTPS", str(ctx.exception))
 
 
