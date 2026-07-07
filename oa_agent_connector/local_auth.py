@@ -245,7 +245,7 @@ def _form_html(base_url: str, session: str, token: str, error: str = "", insecur
     scheme = urllib.parse.urlparse(str(base_url)).scheme.lower()
     warning_html = ""
     if scheme == "http" and insecure:
-        warning_html = '<p class="error">当前 OA 地址不是 HTTPS。请确认这是公司可信内网地址后再输入账号密码。</p>'
+        warning_html = '<p class="error">请确认这是公司 OA 登录页面，再输入账号和密码。</p>'
     body = f"""
 <h1>OA 授权登录</h1>
 <p class="muted">请在本机页面输入 OA 账号和密码。密码只用于本次登录，不会保存，也不会写入聊天记录。若浏览器询问是否保存密码，请选择不保存。</p>

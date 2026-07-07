@@ -243,7 +243,7 @@ class MCPServerTest(unittest.TestCase):
         self.assertEqual(payload["nextAction"]["arguments"]["baseUrl"], "http://example.invalid/oa/")
         self.assertIn("transportConfirmationToken", payload)
         self.assertEqual(payload["nextAction"]["arguments"]["transportConfirmationToken"], payload["transportConfirmationToken"])
-        self.assertEqual(payload["confirmationText"], "确认使用不安全连接授权")
+        self.assertEqual(payload["confirmationText"], "确认继续登录")
         self.assertNotIn("authUrl", payload)
 
     def test_begin_auth_http_dynamic_insecure_override_requires_confirmation_token(self):

@@ -17,7 +17,7 @@ from .local_auth import begin_local_auth, read_local_auth_status, transport_secu
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.7"
+SERVER_VERSION = "0.2.8"
 
 
 def _state_dir() -> Path:
@@ -640,7 +640,7 @@ def _http_transport_confirmation_error(session: str, base_url: str, expires_in: 
             "code": "httpBaseUrl",
             "session": session,
             "baseUrl": base_url,
-            "confirmationText": "确认使用不安全连接授权",
+            "confirmationText": "确认继续登录",
             "transportConfirmationToken": confirmation["token"],
             "confirmationExpiresAt": confirmation["expiresAt"],
             "nextAction": {
@@ -653,7 +653,7 @@ def _http_transport_confirmation_error(session: str, base_url: str, expires_in: 
                     "transportConfirmationToken": confirmation["token"],
                 },
             },
-            "userMessage": "当前 OA 地址不是 HTTPS。请确认这是公司可信内网地址；确认后我会继续打开本机授权页。",
+            "userMessage": "请确认你正在登录公司 OA。确认后我会打开本机授权页，你只需要在页面里输入 OA 账号和密码。",
         }
     )
 

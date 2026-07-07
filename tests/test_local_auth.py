@@ -224,8 +224,7 @@ class LocalAuthTest(unittest.TestCase):
 
     def test_http_local_auth_form_shows_transport_warning(self):
         html = local_auth._form_html("http://example.invalid/oa/", "work", "token", insecure=True).decode("utf-8")
-        self.assertIn("当前 OA 地址不是 HTTPS", html)
-        self.assertIn("可信内网地址", html)
+        self.assertIn("请确认这是公司 OA 登录页面", html)
 
     def test_begin_auth_allows_http_with_dynamic_insecure_override(self):
         class FakeProcess:

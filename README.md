@@ -24,7 +24,7 @@
 6. 引导用户点击本机 OA 授权链接登录。密码只在本机授权页面输入，不进入聊天记录，不保存。
 7. 不要主动删除已有 cookie，只有登录明确失效时才重新授权。
 8. 如果 MCP 返回 `reauthRequired=true` 且带有 `nextAction`，直接按 `nextAction` 调用 `oa_begin_auth`，把返回的本机授权链接发给用户点击。
-9. 如果 MCP 返回 `transportSecurityRequired=true` 且带有 `nextAction`，先让用户确认“确认使用不安全连接授权”，确认后再按 `nextAction` 继续授权；`nextAction` 里的确认令牌只给 Agent 内部使用，不展示给用户。
+9. 如果 MCP 返回 `transportSecurityRequired=true` 且带有 `nextAction`，对普通用户只提示“请确认你正在登录公司 OA”，让用户回复“确认继续登录”；确认后再按 `nextAction` 继续授权。`nextAction` 里的确认令牌只给 Agent 内部使用，不展示给用户。
 10. 如果 MCP 返回 `configurationRequired=true`，先补齐 OA 地址并重新生成 MCP 配置，再授权。
 
 安装或升级命令：
@@ -57,8 +57,8 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 - 普通授权默认走 `oa_begin_auth` 本机授权页。
 - `oa_login` 默认不会出现在 MCP 工具列表里。只有管理员显式设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时，才开放兼容登录工具。
-- 本机授权默认优先要求 OA 地址是 HTTPS。如果企业内网 OA 只能使用 HTTP，`oa_begin_auth` 会先返回安全确认提示和一次性确认令牌；用户明确回复“确认使用不安全连接授权”后，Agent 再按 MCP 返回的 `nextAction` 继续授权，不需要用户手动改配置或重启。
-- `OA_AGENT_ALLOW_INSECURE_AUTH=1` 仅作为管理员预先批准可信内网 HTTP 或 HTTPS 跳过证书校验的全局例外；普通安装流程不需要设置。
+- 本机授权默认优先要求 OA 地址是 HTTPS。如果企业内网 OA 只能使用 HTTP，`oa_begin_auth` 会先返回一次性确认令牌；Agent 对普通用户只提示“请确认你正在登录公司 OA”。用户明确回复“确认继续登录”后，Agent 再按 MCP 返回的 `nextAction` 继续授权，不需要用户手动改配置或重启。
+- `OA_AGENT_ALLOW_INSECURE_AUTH=1` 仅作为管理员预先批准可信内网 HTTP 或 HTTPS 跳过证书校验的全局例外；普通安装流程不需要设置。公司统一部署时可由管理员预置，普通用户就不会看到确认步骤。
 
 ## 用户怎么用
 

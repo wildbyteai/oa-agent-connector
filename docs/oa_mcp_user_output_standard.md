@@ -123,7 +123,7 @@ Agent 输出：
 Agent 行为：
 
 - 如果 MCP 返回 `reauthRequired=true` 且带有 `nextAction`，直接按 `nextAction` 调用 `oa_begin_auth`，不要问用户是否重新授权。
-- 如果 MCP 返回 `transportSecurityRequired=true` 且带有 `nextAction`，先要求用户确认安全例外；用户回复固定确认词后，再按 `nextAction` 调用 `oa_begin_auth`。不要向用户展示确认令牌。
+- 如果 MCP 返回 `transportSecurityRequired=true` 且带有 `nextAction`，对普通用户只确认是否正在登录公司 OA；用户回复固定确认词后，再按 `nextAction` 调用 `oa_begin_auth`。不要向用户展示确认令牌。
 - 把 `oa_begin_auth` 返回的本机授权链接展示给用户点击。
 - 不要要求用户在聊天里发送 OA 密码。
 - 重新登录成功后，自动继续执行用户刚才的查询或操作。
@@ -136,15 +136,15 @@ cookie 过期
 401 Unauthorized
 ```
 
-如果 OA 地址不是 HTTPS，MCP 返回了安全确认提示，Agent 输出：
+如果 MCP 返回登录前确认提示，Agent 输出：
 
 ```text
-当前 OA 地址不是 HTTPS。请确认这是公司可信内网地址。
+请确认你正在登录公司 OA。
 
-确认后请回复：确认使用不安全连接授权
+确认后请回复：确认继续登录
 ```
 
-用户回复“确认使用不安全连接授权”后，Agent 才能继续生成本机授权链接。不要让用户手动修改 MCP 配置或重启。
+用户回复“确认继续登录”后，Agent 才能继续生成本机授权链接。不要让用户手动修改 MCP 配置或重启。
 
 如果 MCP 提示 HTTPS 证书校验不能跳过，Agent 输出：
 
