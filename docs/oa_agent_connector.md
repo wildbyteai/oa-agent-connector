@@ -71,6 +71,7 @@ MCP 普通授权默认使用 `oa_begin_auth` 本机授权页。`oa_login` 默认
 ## 搜索与附件边界
 
 - `oa_search_objects` 只做 OA 当前账号权限内的只读搜索；本地支持 `matchMode=keyword/contains/exact`，其中 `contains/exact` 会忽略标题空白。
+- `searchFields=["title"]` 只作为 MCP 本地标题过滤，不下发 OA 的标题字段，避免 OA 搜索接口返回通用错误。
 - `oa_search_objects` 默认 `requireDetail=true`，只返回可继续通过 `oa_get_object_detail` 查看详情的结果。
 - `oa_search_objects` 默认 `dedupByDocument=true`，按 `fdId` 聚合同一文档下的附件级命中，并返回 `normalizedTitle`、`type`、`attachmentCount`、`attachmentTitles`、`detailUrl`。
 - `detailUrl` 由当前 `baseUrl` 和受控站内 `recordRef.path` 拼接生成，仅用于浏览器打开 OA 原生详情页；下载附件仍必须通过详情页附件序号。

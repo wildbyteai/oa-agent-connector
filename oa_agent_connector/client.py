@@ -229,12 +229,19 @@ class OAClient:
         raw_fields = params.get("searchFields") or []
         if isinstance(raw_fields, str):
             raw_fields = [raw_fields]
+        requested_fields: List[str] = []
         search_fields: List[str] = []
         for field in raw_fields:
             field = str(field)
             if field not in SEARCH_FIELD_MAP:
                 raise OAConnectorError("不支持的搜索字段")
-            search_fields.append(SEARCH_FIELD_MAP[field])
+            if field in requested_fields:
+                continue
+            requested_fields.append(field)
+            if field != "title":
+                search_fields.append(SEARCH_FIELD_MAP[field])
+        has_title_field = "title" in requested_fields
+        title_only_search = has_title_field and len(requested_fields) == 1
 
         doc_file_type = str(params.get("docFileType") or "")
         if doc_file_type not in ALLOWED_DOC_FILE_TYPES:
@@ -288,6 +295,8 @@ class OAClient:
             "matchMode": match_mode,
             "outKeyword": str(params.get("outKeyword") or ""),
             "searchFields": search_fields,
+            "requestedSearchFields": requested_fields,
+            "localTitleOnly": title_only_search,
             "docFileType": doc_file_type,
             "timeRange": time_range,
             "fromCreateTime": from_create_time,
@@ -425,6 +434,8 @@ class OAClient:
             normalized_title = self._normalize_search_text(title)
             matched_exact = normalized_title == validated["normalizedQuery"]
             matched_contains = bool(validated["normalizedQuery"] and validated["normalizedQuery"] in normalized_title)
+            if validated["localTitleOnly"] and not matched_contains:
+                continue
             if validated["matchMode"] == "exact" and not matched_exact:
                 continue
             if validated["matchMode"] == "contains" and not matched_contains:
@@ -475,6 +486,8 @@ class OAClient:
             "query": validated["query"],
             "normalizedQuery": validated["normalizedQuery"],
             "matchMode": validated["matchMode"],
+            "searchFields": validated["requestedSearchFields"],
+            "localTitleOnly": validated["localTitleOnly"],
             "dedupByDocument": validated["dedupByDocument"],
             "requireDetail": validated["requireDetail"],
             "items": items,

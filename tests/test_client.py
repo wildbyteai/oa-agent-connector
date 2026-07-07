@@ -214,7 +214,7 @@ class SearchValidationTest(unittest.TestCase):
         self.assertEqual(params["query"], "出厂报告-产品A")
         self.assertEqual(params["scope"], "knowledge")
         self.assertEqual(params["modelName"], "KmsMultidocKnowledge")
-        self.assertEqual(params["searchFields"], ["subject", "attachment"])
+        self.assertEqual(params["searchFields"], ["attachment"])
         self.assertEqual(params["pageSize"], 20)
 
     def test_validate_search_params_rejects_bad_values(self):
@@ -362,7 +362,61 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertEqual(client.last_request["params"]["docFileType"], "pdf")
         self.assertEqual(client.last_request["params"]["sortType"], "time")
         self.assertEqual(client.last_request["params"]["sortOrder"], "desc")
-        self.assertEqual(client.last_request["params"]["searchFields"], "subject,attachment")
+        self.assertEqual(client.last_request["params"]["searchFields"], "attachment")
+        self.assertEqual(result["searchFields"], ["title", "attachment"])
+
+    def test_search_objects_title_field_is_filtered_locally(self):
+        payload = {
+            "queryPage": {
+                "totalrows": 2,
+                "list": [
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "三 草 两 木 白 管 星 钻 唇膏"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "无关文档"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=28256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                ],
+            }
+        }
+        client = FakeSearchClient(payload)
+
+        result = client.search_objects(
+            query="三草两木白管星钻唇膏",
+            scope="knowledge",
+            searchFields=["title"],
+        )
+
+        self.assertNotIn("searchFields", client.last_request["params"])
+        self.assertTrue(result["localTitleOnly"])
+        self.assertEqual(result["searchFields"], ["title"])
+        self.assertEqual(len(result["items"]), 1)
+        self.assertEqual(result["items"][0]["normalizedTitle"], "三草两木白管星钻唇膏")
+
+    def test_search_objects_non_title_field_still_passes_remote_field(self):
+        client = FakeSearchClient({"queryPage": {"totalrows": 0, "list": []}})
+
+        result = client.search_objects(
+            query="三草两木白管星钻唇膏",
+            scope="knowledge",
+            searchFields=["content"],
+        )
+
+        self.assertEqual(client.last_request["params"]["searchFields"], "content")
+        self.assertFalse(result["localTitleOnly"])
+        self.assertEqual(result["searchFields"], ["content"])
 
     def test_search_objects_normalizes_cjk_spaces_for_contains_and_exact_modes(self):
         payload = {
