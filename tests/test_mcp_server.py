@@ -107,6 +107,9 @@ class MCPServerTest(unittest.TestCase):
                 payload = json.loads(result["content"][0]["text"])
                 self.assertIn("guide", payload)
                 self.assertEqual(payload["guide"][1]["tool"], "oa_login")
+                self.assertTrue(payload["configurationRequired"])
+                self.assertFalse(payload["reauthRequired"])
+                self.assertIsNone(payload["nextAction"])
 
     def test_auth_error_does_not_delete_cookie_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -140,6 +143,10 @@ class MCPServerTest(unittest.TestCase):
                         }
                     )
                 self.assertTrue(listed["result"]["isError"])
+                payload = json.loads(listed["result"]["content"][0]["text"])
+                self.assertTrue(payload["reauthRequired"])
+                self.assertEqual(payload["nextAction"]["tool"], "oa_login")
+                self.assertEqual(payload["nextAction"]["arguments"]["baseUrl"], "https://example.invalid/oa/")
                 self.assertTrue(cookie_path.exists())
 
     def test_prepare_then_confirm_approval(self):
@@ -355,6 +362,28 @@ class SearchMCPServerTest(unittest.TestCase):
                             self.assertIn("不接受参数", text)
                     # FakeClient 不应被实例化（OAClient 不应被调用）
                     self.assertEqual(call_count["n"], 0)
+
+    def test_search_auth_error_returns_reauth_next_action(self):
+        class SearchAuthExpiredClient(FakeClient):
+            def search_objects(self, **kwargs):
+                raise RuntimeError("当前会话未登录，不能搜索 OA 内容")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"}, clear=False):
+                with patch.object(mcp_server, "OAClient", SearchAuthExpiredClient):
+                    response = mcp_server.handle({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "oa_search_objects", "arguments": {"query": "abc", "session": "work"}},
+                    })
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(response["result"]["isError"])
+        self.assertTrue(payload["reauthRequired"])
+        self.assertEqual(payload["nextAction"]["tool"], "oa_login")
+        self.assertEqual(payload["nextAction"]["arguments"]["baseUrl"], "https://example.invalid/oa/")
+        self.assertEqual(payload["nextAction"]["arguments"]["session"], "work")
 
 
 class SensitiveOutputRegressionTest(unittest.TestCase):

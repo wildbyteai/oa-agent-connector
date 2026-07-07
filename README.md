@@ -23,6 +23,8 @@
 5. 把生成的 MCP 配置加入 Agent 客户端，并刷新或重启 MCP 工具。
 6. 引导用户用自己的 OA 账号登录授权。密码只用于登录，不保存。
 7. 不要主动删除已有 cookie，只有登录明确失效时才重新授权。
+8. 如果 MCP 返回 `reauthRequired=true` 且带有 `nextAction`，直接按 `nextAction` 发起重新授权流程：使用已配置的 OA 地址，只向用户索取 OA 账号和密码，然后调用 `oa_login`。
+9. 如果 MCP 返回 `configurationRequired=true`，先补齐 OA 地址并重新生成 MCP 配置，再授权。
 
 安装或升级命令：
 

@@ -159,6 +159,8 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 - 如果 MCP 客户端根本没有配置 `oa-agent-mcp`，这个 MCP 无法被调用，因此不能由 MCP 自己弹出引导；需要客户端安装页、插件市场说明或人工文档先完成 MCP 配置。
 - 一旦 MCP 已配置但缺少 `OA_BASE_URL`、没有登录 cookie、cookie 过期，`oa_list_todos` 会返回分步引导，不会只抛出裸错误，也不会擅自删除已有 cookie。
+- 如果返回里有 `reauthRequired=true` 和 `nextAction`，Agent 不需要询问“是否重新授权”，应直接按 `nextAction` 发起重新授权：使用已配置 OA 地址和原 session，只向用户索取 OA 账号和密码，然后调用 `oa_login`。
+- 如果返回里有 `configurationRequired=true`，说明连接器还不知道 OA 地址。Agent 应先让用户提供 OA 地址，重新生成 MCP 配置，再继续授权。
 
 可主动调用 `oa_setup_guide` 获取同一套引导：
 

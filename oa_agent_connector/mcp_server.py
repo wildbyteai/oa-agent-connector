@@ -16,7 +16,7 @@ from .client import OAClient, OAConnectorError
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.3"
+SERVER_VERSION = "0.2.4"
 
 
 def _state_dir() -> Path:
@@ -40,6 +40,17 @@ def _session_paths(session: str) -> Dict[str, Path]:
         "cookie": root / f"{safe}.cookies",
         "meta": root / f"{safe}.json",
     }
+
+
+def _saved_base_url(session: str) -> Optional[str]:
+    meta = _session_paths(session)["meta"]
+    if not meta.exists():
+        return None
+    try:
+        value = json.loads(meta.read_text(encoding="utf-8")).get("baseUrl")
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    return str(value) if value else None
 
 
 def _pending_dir() -> Path:
@@ -67,9 +78,9 @@ def _load_base_url(session: str, base_url: Optional[str]) -> str:
     env_base = os.getenv("OA_BASE_URL")
     if env_base:
         return env_base
-    paths = _session_paths(session)
-    if paths["meta"].exists():
-        return json.loads(paths["meta"].read_text(encoding="utf-8"))["baseUrl"]
+    saved_base = _saved_base_url(session)
+    if saved_base:
+        return saved_base
     raise OAConnectorError("缺少 baseUrl：请先调用 oa_login，或传入 baseUrl/OA_BASE_URL")
 
 
@@ -98,12 +109,51 @@ def _mcp_error(data: Any) -> Dict[str, Any]:
     }
 
 
-def _setup_guide(reason: str = "") -> Dict[str, Any]:
-    example_base_url = os.getenv("OA_BASE_URL") or "<OA_BASE_URL>"
+def _auth_required_reason(reason: str) -> bool:
+    text = str(reason or "")
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "当前会话未登录",
+            "cookie 未登录",
+            "cookie 已失效",
+            "未登录",
+            "未授权",
+            "授权失效",
+            "授权不可用",
+            "登录状态不可用",
+            "登录失败",
+            "登录页",
+            "仍停留在登录页",
+            "请先 login",
+            "http 401",
+            "unauthorized",
+        )
+    )
+
+
+def _setup_guide(reason: str = "", session: str = "default") -> Dict[str, Any]:
+    example_base_url = os.getenv("OA_BASE_URL") or _saved_base_url(session) or "<OA_BASE_URL>"
     example_state_dir = os.getenv("OA_AGENT_STATE_DIR") or str(_state_dir())
+    auth_required = _auth_required_reason(reason)
+    base_url_configured = example_base_url != "<OA_BASE_URL>"
+    login_action = {
+        "tool": "oa_login",
+        "arguments": {
+            "baseUrl": example_base_url,
+            "username": "用户自己的 OA 账号",
+            "password": "用户自己的 OA 密码",
+            "session": session,
+        },
+    }
     return {
         "ok": False,
         "reason": reason,
+        "session": session,
+        "configurationRequired": not base_url_configured,
+        "reauthRequired": auth_required,
+        "nextAction": login_action if auth_required and base_url_configured else None,
         "guide": [
             {
                 "step": 1,
@@ -125,20 +175,14 @@ def _setup_guide(reason: str = "") -> Dict[str, Any]:
                 "step": 2,
                 "title": "授权登录",
                 "description": "调用 oa_login，使用用户自己的 OA 账号密码登录。密码不会保存，只保存登录 cookie。",
-                "tool": "oa_login",
-                "arguments": {
-                    "baseUrl": example_base_url,
-                    "username": "用户自己的 OA 账号",
-                    "password": "用户自己的 OA 密码",
-                    "session": "default",
-                },
+                **login_action,
             },
             {
                 "step": 3,
                 "title": "查询待办",
                 "description": "授权成功后调用 oa_list_todos，只会返回当前登录账号有权限看到的待审批清单。",
                 "tool": "oa_list_todos",
-                "arguments": {"session": "default", "page": 1, "pageSize": 20},
+                "arguments": {"session": session, "page": 1, "pageSize": 20},
             },
         ],
     }
@@ -160,8 +204,8 @@ def _redact_tool_message(message: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:200]
 
 
-def _tool_error(message: str) -> Dict[str, Any]:
-    return _mcp_error(_setup_guide(_redact_tool_message(message)))
+def _tool_error(message: str, session: str = "default") -> Dict[str, Any]:
+    return _mcp_error(_setup_guide(_redact_tool_message(message), session=session))
 
 
 def _plain_text(value: Any) -> str:
@@ -248,6 +292,7 @@ TOOLS = [
         "当用户想查看 OA 待办但 MCP 未配置、未授权或授权过期时，返回分步配置和授权指引。",
         {
             "reason": {"type": "string", "description": "触发指引的原因，可选"},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
         },
     ),
     _tool_schema(
@@ -485,7 +530,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     insecure = _bool(args, "insecure")
 
     if name == "oa_setup_guide":
-        return _ok(_setup_guide(str(args.get("reason") or "")))
+        return _ok(_setup_guide(str(args.get("reason") or ""), session=session))
 
     if name == "oa_login":
         base_url = str(args["baseUrl"])
@@ -700,10 +745,11 @@ def handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if method == "tools/list":
             return _response(message_id, {"tools": TOOLS})
         if method == "tools/call":
+            tool_args = dict(params.get("arguments") or {})
             try:
-                result = call_tool(str(params["name"]), dict(params.get("arguments") or {}))
+                result = call_tool(str(params["name"]), tool_args)
             except Exception as exc:
-                result = _tool_error(str(exc))
+                result = _tool_error(str(exc), session=_session(tool_args))
             return _response(message_id, result)
         return _response(message_id, error={"code": -32601, "message": f"Method not found: {method}"})
     except Exception as exc:
