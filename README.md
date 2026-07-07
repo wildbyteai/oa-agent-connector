@@ -86,6 +86,8 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 用户说“完全匹配某个产品名”时，Agent 应优先使用 `matchMode=contains`，它会自动忽略 OA 标题里的空格，并按文档去重。`matchMode=exact` 表示标题去空格后必须和搜索词完全相等，适合标题非常确定的场景。
 
+所有展示给用户的查询结果都应能继续查看详情。搜索工具默认只返回可查看详情的结果；如果某类 OA 数据暂不支持详情解析，Agent 不应把它放进可点击列表。
+
 继续查看和下载：
 
 ```text

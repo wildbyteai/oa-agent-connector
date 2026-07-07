@@ -49,6 +49,10 @@ class OAClientTest(unittest.TestCase):
         todos = client.list_todos()
         self.assertEqual(todos[0].fd_id, "1234567890abcdef1234567890abcdef")
         self.assertEqual(todos[0].subject, "采购审批")
+        todo = todos[0].to_dict()
+        self.assertTrue(todo["detailAvailable"])
+        self.assertEqual(todo["detailAction"]["tool"], "oa_get_detail")
+        self.assertEqual(todo["detailAction"]["arguments"]["fdId"], "1234567890abcdef1234567890abcdef")
 
     def test_parse_landray_column_datas(self):
         payload = {
@@ -121,6 +125,8 @@ class SearchSchemaTest(unittest.TestCase):
         self.assertEqual(schema["limits"]["batchQueriesMax"], 100)
         self.assertEqual(schema["limits"]["detailTextLimitMax"], 20000)
         self.assertEqual(schema["limits"]["downloadMaxBytesDefault"], 52428800)
+        self.assertTrue(schema["resultDefaults"]["requireDetail"])
+        self.assertTrue(schema["resultDefaults"]["dedupByDocument"])
 
     def test_get_search_schema_rejects_unknown_scope(self):
         client = FakeOAClient("{}")
@@ -275,6 +281,9 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertEqual(item["normalizedTitle"], "出厂报告-产品A")
         self.assertEqual(item["type"], "document")
         self.assertEqual(item["attachmentCount"], 0)
+        self.assertTrue(item["detailAvailable"])
+        self.assertEqual(item["detailAction"]["tool"], "oa_get_object_detail")
+        self.assertEqual(item["detailAction"]["arguments"]["recordRef"], item["recordRef"])
         self.assertEqual(client.last_request["params"]["resultType"], "json")
         self.assertEqual(client.last_request["params"]["bond"], "like")
         self.assertEqual(client.last_request["params"]["docFileType"], "pdf")
@@ -375,6 +384,48 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertFalse(raw["dedupByDocument"])
         self.assertEqual(len(raw["items"]), 3)
         self.assertEqual([item["type"] for item in raw["items"]], ["attachment", "attachment", "document"])
+
+    def test_search_objects_requires_detail_by_default(self):
+        payload = {
+            "queryPage": {
+                "totalrows": 2,
+                "list": [
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "可查看详情文档"},
+                            "modelName": {"value": "KmsMultidocKnowledge"},
+                            "linkStr": {
+                                "value": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                    {
+                        "lksFieldsMap": {
+                            "subject": {"value": "新闻结果"},
+                            "modelName": {"value": "SysNewsMain"},
+                            "linkStr": {
+                                "value": "/sys/news/sys_news_main/sysNewsMain.do?method=view&fdId=28256d188087f3669a0808d440da67a6"
+                            },
+                        },
+                    },
+                ],
+            }
+        }
+        client = FakeSearchClient(payload)
+
+        default_result = client.search_objects(query="详情", scope="all", pageSize=10)
+        raw_result = client.search_objects(query="详情", scope="all", pageSize=10, requireDetail=False, dedupByDocument=False)
+
+        self.assertTrue(default_result["requireDetail"])
+        self.assertEqual(default_result["candidateCount"], 2)
+        self.assertEqual(default_result["detailFilteredCount"], 1)
+        self.assertEqual(len(default_result["items"]), 1)
+        self.assertTrue(default_result["items"][0]["detailAvailable"])
+        self.assertEqual(default_result["items"][0]["title"], "可查看详情文档")
+        self.assertFalse(raw_result["requireDetail"])
+        self.assertEqual(len(raw_result["items"]), 2)
+        self.assertFalse(raw_result["items"][1]["detailAvailable"])
+        self.assertIsNone(raw_result["items"][1]["detailAction"])
 
     def test_search_objects_parses_landray_lks_field_values(self):
         payload = {
@@ -644,7 +695,21 @@ class FakeBatchClient(FakeSearchClient):
                         "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
                     },
                     "title": query,
+                    "normalizedTitle": query,
                     "matchedExactTitle": matched,
+                    "matchedContainsTitle": matched,
+                    "detailAvailable": True,
+                    "detailAction": {
+                        "tool": "oa_get_object_detail",
+                        "arguments": {
+                            "recordRef": {
+                                "scope": "knowledge",
+                                "modelName": "KmsMultidocKnowledge",
+                                "recordId": "18256d188087f3669a0808d440da67a6",
+                                "path": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+                            }
+                        },
+                    },
                     "attachments": [],
                 }
             ] if matched else [],
@@ -685,6 +750,8 @@ class BatchSearchObjectsTest(unittest.TestCase):
         self.assertEqual(result["summary"]["totalQueries"], 3)
         self.assertEqual(result["summary"]["matchedQueries"], 1)
         self.assertEqual(result["summary"]["errors"], 1)
+        self.assertTrue(result["items"][0]["results"][0]["detailAvailable"])
+        self.assertEqual(result["items"][0]["results"][0]["detailAction"]["tool"], "oa_get_object_detail")
         self.assertEqual(result["items"][0]["results"][0]["attachments"][0]["name"], "报告.pdf")
         self.assertNotIn("Cookie", result["items"][1]["error"])
 

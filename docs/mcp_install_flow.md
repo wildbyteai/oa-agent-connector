@@ -173,12 +173,13 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 推荐 agent 行为：
 
 1. 识别用户要在 OA 内部搜索，而不是网页搜索或本地文件搜索。
-2. 调用 `oa_search_objects`，默认使用 `scope=all`，按用户原话传入关键词。
-3. 如果用户表达“完整标题”“完全匹配某个产品名”“标题里有这句话”，优先使用 `matchMode=contains`。它会自动忽略 OA 标题中的空白，并默认按文档去重。
-4. 如果用户明确要求“标题必须完全等于这句话”，使用 `matchMode=exact`。它同样会忽略标题中的空白，但要求归一化后完全相等。
-5. 展示 OA 返回的前几条结果，普通用户只看标题、创建人、时间、附件数量和序号。
-6. 用户说“看第 1 条详情”时，使用搜索结果里的 `recordRef` 调用 `oa_get_object_detail`。
-7. 用户说“下载第 1 条附件”时，先确认该详情页里有附件，再用 `oa_download_attachment` 下载。
+2. 调用 `oa_search_objects`。普通 OA 文档搜索优先使用 `scope=knowledge`；只有用户明确要搜全部 OA 时才使用 `scope=all`。
+3. 保持默认 `requireDetail=true`，只返回可继续查看详情的结果。
+4. 如果用户表达“完整标题”“完全匹配某个产品名”“标题里有这句话”，优先使用 `matchMode=contains`。它会自动忽略 OA 标题中的空白，并默认按文档去重。
+5. 如果用户明确要求“标题必须完全等于这句话”，使用 `matchMode=exact`。它同样会忽略标题中的空白，但要求归一化后完全相等。
+6. 展示 OA 返回的前几条结果，普通用户只看标题、创建人、时间、附件数量和序号。
+7. 用户说“看第 1 条详情”时，使用搜索结果里的 `detailAction` 或 `recordRef` 调用 `oa_get_object_detail`。
+8. 用户说“下载第 1 条附件”时，先确认该详情页里有附件，再用 `oa_download_attachment` 下载。
 
 推荐触发话术：
 
@@ -197,6 +198,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 注意边界：
 
 - 搜索结果来自 OA 当前登录账号可见的数据。
+- 查询结果列表必须能继续查看详情；不可查看详情的数据不能放进用户可选择列表。
 - `oa_search_objects` 已内置标题去空白匹配、`matchMode=contains/exact` 和默认按文档去重。Agent 如果再做额外过滤或重新排序，必须明确告诉用户这是 Agent 的二次处理。
 - 附件下载只能基于 `oa_get_object_detail` 返回的附件序号，不能接受任意下载 URL。
 - 下载目录应使用本机安全目录；不要覆盖用户已有文件，除非用户明确要求。
@@ -279,7 +281,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 - `oa_list_todos`：查询当前登录账号待办清单。
 - `oa_get_detail`：查看待审批单据详情。
 - `oa_get_search_schema`：查看当前 MCP 支持的 OA 搜索范围、字段、排序和限制。
-- `oa_search_objects`：执行 OA 通用只读搜索，支持 `matchMode=keyword/contains/exact`，默认按文档去重，返回可继续查看详情的结果。
+- `oa_search_objects`：执行 OA 通用只读搜索，支持 `matchMode=keyword/contains/exact`，默认 `requireDetail=true` 且按文档去重，返回可继续查看详情的结果。
 - `oa_get_object_detail`：按搜索结果查看 OA 文档详情和附件列表。
 - `oa_download_attachment`：按详情页附件序号下载当前账号可见附件。
 - `oa_batch_search_objects`：批量执行 OA 搜索，可用于多关键词查找。

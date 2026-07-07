@@ -103,7 +103,15 @@ class OATodo:
     raw: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        data = {"fdId": self.fd_id, "subject": self.subject}
+        data = {
+            "fdId": self.fd_id,
+            "subject": self.subject,
+            "detailAvailable": True,
+            "detailAction": {
+                "tool": "oa_get_detail",
+                "arguments": {"fdId": self.fd_id},
+            },
+        }
         if self.raw:
             data["raw"] = self.raw
         return data
@@ -176,6 +184,7 @@ class OAClient:
             "sortOrders": list(ALLOWED_SORT_ORDERS),
             "timeRanges": [value for value in ALLOWED_TIME_RANGES if value],
             "docFileTypes": [value for value in ALLOWED_DOC_FILE_TYPES if value],
+            "resultDefaults": {"requireDetail": True, "dedupByDocument": True},
             "limits": dict(SEARCH_LIMITS),
         }
 
@@ -280,6 +289,7 @@ class OAClient:
             "exactTitle": exact_title,
             "onlyExactTitle": only_exact_title,
             "dedupByDocument": self._bool_param(params.get("dedupByDocument"), True),
+            "requireDetail": self._bool_param(params.get("requireDetail"), True),
             "page": page,
             "pageSize": page_size,
         }
@@ -374,6 +384,7 @@ class OAClient:
             rows = []
 
         items: List[Dict[str, Any]] = []
+        candidate_count = 0
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -397,6 +408,9 @@ class OAClient:
                 continue
             model_name = str(record_ref.get("modelName") or row.get("modelName") or "")
             supports_detail, supports_attachments = self._model_capabilities(validated["scope"], model_name)
+            candidate_count += 1
+            if validated["requireDetail"] and not supports_detail:
+                continue
             summary = self._strip_html(
                 self._search_row_value(row, "content")
                 or self._search_row_value(row, "fdDescription")
@@ -421,6 +435,8 @@ class OAClient:
                     "attachmentTitles": [],
                     "supportsDetail": supports_detail,
                     "supportsAttachments": supports_attachments,
+                    "detailAvailable": supports_detail,
+                    "detailAction": self._detail_action(record_ref) if supports_detail else None,
                 }
             )
         original_item_count = len(items)
@@ -432,10 +448,13 @@ class OAClient:
             "normalizedQuery": validated["normalizedQuery"],
             "matchMode": validated["matchMode"],
             "dedupByDocument": validated["dedupByDocument"],
+            "requireDetail": validated["requireDetail"],
             "items": items,
             "page": validated["page"],
             "pageSize": validated["pageSize"],
             "total": total if total is not None else len(items),
+            "candidateCount": candidate_count,
+            "detailFilteredCount": candidate_count - original_item_count,
             "filteredCount": original_item_count,
             "returnedCount": len(items),
             "totalNote": "total 以 OA 搜索接口返回为准；items 已按本地 matchMode 和 dedupByDocument 处理",
@@ -457,6 +476,12 @@ class OAClient:
 
     def _normalize_search_text(self, value: Any) -> str:
         return re.sub(r"\s+", "", self._strip_html(str(value or "")))
+
+    def _detail_action(self, record_ref: Dict[str, str]) -> Dict[str, Any]:
+        return {
+            "tool": "oa_get_object_detail",
+            "arguments": {"recordRef": record_ref},
+        }
 
     def _search_result_type(self, row: Dict[str, Any], title: str) -> str:
         if self._search_row_value(row, "fileName"):
@@ -1192,6 +1217,8 @@ class OAClient:
                         "matchedContainsTitle": result_item.get("matchedContainsTitle", False),
                         "attachmentCount": result_item.get("attachmentCount", 0),
                         "attachmentTitles": result_item.get("attachmentTitles", []),
+                        "detailAvailable": result_item.get("detailAvailable", False),
+                        "detailAction": result_item.get("detailAction"),
                         "attachments": [],
                         "downloaded": [],
                     }

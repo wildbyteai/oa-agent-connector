@@ -239,6 +239,7 @@ class SearchMCPServerTest(unittest.TestCase):
         self.assertIn("query", search_props)
         self.assertEqual(search_props["scope"]["enum"], ["all", "knowledge", "news"])
         self.assertEqual(search_props["matchMode"]["enum"], ["keyword", "contains", "exact"])
+        self.assertIn("requireDetail", search_props)
         self.assertIn("dedupByDocument", search_props)
         self.assertIn("title", search_props["searchFields"]["items"]["enum"])
         self.assertNotIn("baseUrl", search_props)
@@ -285,12 +286,14 @@ class SearchMCPServerTest(unittest.TestCase):
                                 "query": "abc",
                                 "scope": "knowledge",
                                 "matchMode": "contains",
+                                "requireDetail": False,
                                 "dedupByDocument": False,
                             },
                         },
                     })
                     self.assertEqual(json.loads(searched["result"]["content"][0]["text"])["query"], "abc")
                     self.assertEqual(seen["search"]["matchMode"], "contains")
+                    self.assertFalse(seen["search"]["requireDetail"])
                     self.assertFalse(seen["search"]["dedupByDocument"])
 
                     batched = mcp_server.handle({

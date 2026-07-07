@@ -221,12 +221,13 @@ Agent 标准执行流程：
 
 Agent 标准执行流程：
 
-1. 调用 `oa_search_objects`，按用户原话搜索 OA。
-2. 用户说“完全匹配某个产品名”时，优先用 `matchMode=contains`；它会忽略 OA 标题中的空格，并默认按文档去重。
-3. 将 OA 返回结果按序号展示给用户，不主动展示技术编号。
-4. 用户说“看第 1 条详情”时，调用 `oa_get_object_detail`。
-5. 用户说“下载第 1 条附件”时，先读取详情页附件列表，再调用 `oa_download_attachment`。
-6. 下载完成后告诉用户文件名和保存位置。
+1. 调用 `oa_search_objects`，按用户原话搜索 OA。普通文档搜索优先用 `scope=knowledge`。
+2. 保持默认 `requireDetail=true`，只展示能继续打开详情的结果。
+3. 用户说“完全匹配某个产品名”时，优先用 `matchMode=contains`；它会忽略 OA 标题中的空格，并默认按文档去重。
+4. 将 OA 返回结果按序号展示给用户，不主动展示技术编号。
+5. 用户说“看第 1 条详情”时，调用 `oa_get_object_detail`。
+6. 用户说“下载第 1 条附件”时，先读取详情页附件列表，再调用 `oa_download_attachment`。
+7. 下载完成后告诉用户文件名和保存位置。
 
 搜索结果建议展示字段：
 
@@ -259,6 +260,7 @@ OA 里找到以下结果：
 
 - `matchMode=contains` 表示标题去空格后包含完整搜索词，适合普通用户说的“完全匹配某个产品名”。
 - `matchMode=exact` 表示标题去空格后必须完全等于搜索词，适合标题非常确定的场景。
+- 默认只展示可继续查看详情的结果；暂不支持详情的结果不能放进用户可选择列表。
 - MCP 默认按文档去重，附件级命中会聚合到同一条文档结果里。
 - 如果 Agent 自己再做额外过滤、改排序或隐藏结果，必须告诉用户这是 Agent 的二次处理。
 - 附件下载不能接受用户提供的任意下载链接，只能下载详情页里列出的附件。
@@ -498,7 +500,7 @@ Agent：
 - `oa_list_todos`：查询当前登录账号待办清单。
 - `oa_get_detail`：查看待审批单据详情。
 - `oa_get_search_schema`：查看支持的 OA 搜索范围、字段和限制。
-- `oa_search_objects`：执行 OA 通用只读搜索，支持标题去空格匹配和默认文档去重。
+- `oa_search_objects`：执行 OA 通用只读搜索，默认只返回可查看详情的结果，支持标题去空格匹配和默认文档去重。
 - `oa_get_object_detail`：查看搜索结果详情和附件列表。
 - `oa_download_attachment`：下载详情页中可见的附件。
 - `oa_batch_search_objects`：批量执行 OA 搜索。

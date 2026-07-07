@@ -15,7 +15,7 @@ from .client import OAClient, OAConnectorError
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.2.1"
 
 
 def _state_dir() -> Path:
@@ -351,13 +351,14 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_search_objects",
-        "执行 OA 通用只读搜索，返回结构化结果和受控 recordRef。常用：scope 可选 all/knowledge/news；searchFields 可选 title/content/fdDescription/creator/attachment；matchMode 可选 keyword/contains/exact，contains/exact 会自动忽略标题里的空白；默认 dedupByDocument=true，按文档去重。",
+        "执行 OA 通用只读搜索，返回结构化结果和受控 recordRef。常用：scope 可选 all/knowledge/news；searchFields 可选 title/content/fdDescription/creator/attachment；matchMode 可选 keyword/contains/exact，contains/exact 会自动忽略标题里的空白；默认 requireDetail=true，只返回可继续查看详情的结果；默认 dedupByDocument=true，按文档去重。",
         {
             "query": {"type": "string"},
             "scope": {"type": "string", "enum": ["all", "knowledge", "news"]},
             "modelName": {"type": "string"},
             "bond": {"type": "string", "enum": ["or", "and", "like"]},
             "matchMode": {"type": "string", "enum": ["keyword", "contains", "exact"]},
+            "requireDetail": {"type": "boolean", "description": "默认 true，只返回可用 oa_get_object_detail 查看详情的结果"},
             "dedupByDocument": {"type": "boolean", "description": "默认 true，按 fdId 聚合搜索结果，减少附件级重复条目"},
             "searchFields": {"type": "array", "items": {"type": "string", "enum": ["title", "content", "fdDescription", "creator", "attachment"]}},
             "category": {"type": "string"},
@@ -405,13 +406,14 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_batch_search_objects",
-        "批量执行通用 OA 搜索，输入为 queries 数组，可选列附件或受限下载。支持 matchMode keyword/contains/exact；默认 dedupByDocument=true。",
+        "批量执行通用 OA 搜索，输入为 queries 数组，可选列附件或受限下载。支持 matchMode keyword/contains/exact；默认 requireDetail=true；默认 dedupByDocument=true。",
         {
             "queries": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
             "scope": {"type": "string", "enum": ["all", "knowledge", "news"]},
             "modelName": {"type": "string"},
             "bond": {"type": "string", "enum": ["or", "and", "like"]},
             "matchMode": {"type": "string", "enum": ["keyword", "contains", "exact"]},
+            "requireDetail": {"type": "boolean", "description": "默认 true，只返回可继续查看详情的结果"},
             "dedupByDocument": {"type": "boolean", "description": "默认 true，按 fdId 聚合搜索结果"},
             "searchFields": {"type": "array", "items": {"type": "string", "enum": ["title", "content", "fdDescription", "creator", "attachment"]}},
             "sortType": {"type": "string", "enum": ["relevance", "readCount", "time"]},
@@ -527,6 +529,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                     modelName=args.get("modelName"),
                     bond=args.get("bond") or "or",
                     matchMode=args.get("matchMode") or "",
+                    requireDetail=_bool(args, "requireDetail", True),
                     dedupByDocument=_bool(args, "dedupByDocument", True),
                     searchFields=args.get("searchFields") or [],
                     category=args.get("category") or "",
