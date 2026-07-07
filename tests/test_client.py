@@ -51,6 +51,7 @@ class OAClientTest(unittest.TestCase):
         self.assertEqual(todos[0].subject, "采购审批")
         todo = todos[0].to_dict()
         self.assertTrue(todo["detailAvailable"])
+        self.assertEqual(todo["detailPath"], "/km/review/km_review_main/kmReviewMain.do?method=view&fdId=1234567890abcdef1234567890abcdef")
         self.assertEqual(todo["detailAction"]["tool"], "oa_get_detail")
         self.assertEqual(todo["detailAction"]["arguments"]["fdId"], "1234567890abcdef1234567890abcdef")
 
@@ -281,6 +282,8 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertEqual(item["normalizedTitle"], "出厂报告-产品A")
         self.assertEqual(item["type"], "document")
         self.assertEqual(item["attachmentCount"], 0)
+        self.assertEqual(item["detailPath"], "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6")
+        self.assertEqual(item["detailUrl"], "https://example.invalid/oa/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6")
         self.assertTrue(item["detailAvailable"])
         self.assertEqual(item["detailAction"]["tool"], "oa_get_object_detail")
         self.assertEqual(item["detailAction"]["arguments"]["recordRef"], item["recordRef"])
@@ -426,6 +429,7 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertEqual(len(raw_result["items"]), 2)
         self.assertFalse(raw_result["items"][1]["detailAvailable"])
         self.assertIsNone(raw_result["items"][1]["detailAction"])
+        self.assertTrue(raw_result["items"][1]["detailUrl"].startswith("https://example.invalid/oa/sys/news/"))
 
     def test_search_objects_parses_landray_lks_field_values(self):
         payload = {
@@ -696,6 +700,8 @@ class FakeBatchClient(FakeSearchClient):
                     },
                     "title": query,
                     "normalizedTitle": query,
+                    "detailPath": "/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
+                    "detailUrl": "https://example.invalid/oa/kms/multidoc/kms_multidoc_knowledge/kmsMultidocKnowledge.do?method=view&fdId=18256d188087f3669a0808d440da67a6",
                     "matchedExactTitle": matched,
                     "matchedContainsTitle": matched,
                     "detailAvailable": True,
@@ -752,6 +758,7 @@ class BatchSearchObjectsTest(unittest.TestCase):
         self.assertEqual(result["summary"]["errors"], 1)
         self.assertTrue(result["items"][0]["results"][0]["detailAvailable"])
         self.assertEqual(result["items"][0]["results"][0]["detailAction"]["tool"], "oa_get_object_detail")
+        self.assertTrue(result["items"][0]["results"][0]["detailUrl"].startswith("https://example.invalid/oa/kms/"))
         self.assertEqual(result["items"][0]["results"][0]["attachments"][0]["name"], "报告.pdf")
         self.assertNotIn("Cookie", result["items"][1]["error"])
 

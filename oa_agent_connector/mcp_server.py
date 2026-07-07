@@ -7,6 +7,7 @@ import os
 import secrets
 import sys
 import time
+import urllib.parse
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -15,7 +16,7 @@ from .client import OAClient, OAConnectorError
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.2.2"
 
 
 def _state_dir() -> Path:
@@ -80,6 +81,10 @@ def _client(session: str, base_url: Optional[str] = None, insecure: bool = False
         cookie_file=str(paths["cookie"]),
         verify_tls=not insecure,
     )
+
+
+def _absolute_url(base_url: str, path: str) -> str:
+    return urllib.parse.urljoin(str(base_url).rstrip("/") + "/", str(path or "").lstrip("/"))
 
 
 def _ok(data: Any) -> Dict[str, Any]:
@@ -583,7 +588,12 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "oa_list_todos":
         page = int(args.get("page") or 1)
         page_size = int(args.get("pageSize") or 20)
-        todos = [todo.to_dict() for todo in client.list_todos(page=page, page_size=page_size)]
+        todos = []
+        for todo in client.list_todos(page=page, page_size=page_size):
+            data = todo.to_dict()
+            if data.get("detailPath"):
+                data["detailUrl"] = _absolute_url(client.base_url, str(data["detailPath"]))
+            todos.append(data)
         return _ok({"items": todos, "page": page, "pageSize": page_size, "session": session})
     if name == "oa_get_detail":
         detail = client.get_detail(str(args["fdId"]), require_in_todo=not _bool(args, "allowNonTodo"))

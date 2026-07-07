@@ -178,7 +178,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 4. 如果用户表达“完整标题”“完全匹配某个产品名”“标题里有这句话”，优先使用 `matchMode=contains`。它会自动忽略 OA 标题中的空白，并默认按文档去重。
 5. 如果用户明确要求“标题必须完全等于这句话”，使用 `matchMode=exact`。它同样会忽略标题中的空白，但要求归一化后完全相等。
 6. 展示 OA 返回的前几条结果，普通用户只看标题、创建人、时间、附件数量和序号。
-7. 用户说“看第 1 条详情”时，使用搜索结果里的 `detailAction` 或 `recordRef` 调用 `oa_get_object_detail`。
+7. 用户说“看第 1 条详情”时，使用搜索结果里的 `detailAction` 或 `recordRef` 调用 `oa_get_object_detail`；如果 Agent 客户端支持链接，也可以展示 `detailUrl` 让用户点击打开 OA 原生详情页。
 8. 用户说“下载第 1 条附件”时，先确认该详情页里有附件，再用 `oa_download_attachment` 下载。
 
 推荐触发话术：
@@ -199,6 +199,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 - 搜索结果来自 OA 当前登录账号可见的数据。
 - 查询结果列表必须能继续查看详情；不可查看详情的数据不能放进用户可选择列表。
+- `detailUrl` 只用于打开 OA 原生详情页。用户浏览器没有登录 OA 时，点击后可能先看到 OA 登录页。
 - `oa_search_objects` 已内置标题去空白匹配、`matchMode=contains/exact` 和默认按文档去重。Agent 如果再做额外过滤或重新排序，必须明确告诉用户这是 Agent 的二次处理。
 - 附件下载只能基于 `oa_get_object_detail` 返回的附件序号，不能接受任意下载 URL。
 - 下载目录应使用本机安全目录；不要覆盖用户已有文件，除非用户明确要求。

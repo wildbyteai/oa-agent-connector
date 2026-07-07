@@ -88,6 +88,11 @@ CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 ATTACHMENT_TITLE_RE = re.compile(r"\.(?:pdf|docx?|xlsx?|pptx?|txt|jpe?g|png|gif|bmp|zip|rar|7z)(?:$|[\s)）\]}】])", re.I)
 
 
+def _review_detail_path(fd_id: str) -> str:
+    query = urllib.parse.urlencode({"method": "view", "fdId": fd_id})
+    return f"/km/review/km_review_main/kmReviewMain.do?{query}"
+
+
 class OAConnectorError(RuntimeError):
     pass
 
@@ -103,10 +108,12 @@ class OATodo:
     raw: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        detail_path = _review_detail_path(self.fd_id)
         data = {
             "fdId": self.fd_id,
             "subject": self.subject,
             "detailAvailable": True,
+            "detailPath": detail_path,
             "detailAction": {
                 "tool": "oa_get_detail",
                 "arguments": {"fdId": self.fd_id},
@@ -170,6 +177,9 @@ class OAClient:
         if not verify_tls:
             handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
         self.opener = urllib.request.build_opener(*handlers)
+
+    def absolute_url(self, path: str) -> str:
+        return urllib.parse.urljoin(self.base_url, str(path or "").lstrip("/"))
 
     def get_search_schema(self, scope: str = "all") -> Dict[str, Any]:
         scope = scope or "all"
@@ -417,6 +427,7 @@ class OAClient:
                 or self._search_row_value(row, "fullText")
             )[:300]
             read_count = self._to_int(self._search_row_value(row, "docReadCount") or self._search_row_value(row, "readCount"))
+            detail_path = record_ref["path"]
             items.append(
                 {
                     "recordRef": record_ref,
@@ -424,6 +435,8 @@ class OAClient:
                     "type": self._search_result_type(row, title),
                     "title": title,
                     "normalizedTitle": normalized_title,
+                    "detailPath": detail_path,
+                    "detailUrl": self.absolute_url(detail_path),
                     "summary": summary,
                     "creator": self._strip_html(self._search_row_value(row, "creator")),
                     "createTime": self._search_row_value(row, "createTime"),
@@ -1019,7 +1032,7 @@ class OAClient:
         params: Optional[Dict[str, str]] = None,
         data: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
-        url = urllib.parse.urljoin(self.base_url, path.lstrip("/"))
+        url = self.absolute_url(path)
         if params:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
         body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
@@ -1213,6 +1226,8 @@ class OAClient:
                         "type": result_item.get("type"),
                         "title": result_item.get("title"),
                         "normalizedTitle": result_item.get("normalizedTitle"),
+                        "detailPath": result_item.get("detailPath"),
+                        "detailUrl": result_item.get("detailUrl"),
                         "matchedExactTitle": result_item.get("matchedExactTitle", False),
                         "matchedContainsTitle": result_item.get("matchedContainsTitle", False),
                         "attachmentCount": result_item.get("attachmentCount", 0),

@@ -89,6 +89,7 @@ class MCPServerTest(unittest.TestCase):
                     text = listed["result"]["content"][0]["text"]
                     payload = json.loads(text)
                     self.assertEqual(payload["items"][0]["subject"], "采购审批")
+                    self.assertEqual(payload["items"][0]["detailUrl"], "https://example.invalid/oa/km/review/km_review_main/kmReviewMain.do?method=view&fdId=1234567890abcdef1234567890abcdef")
 
     def test_list_todos_without_config_returns_guide(self):
         with tempfile.TemporaryDirectory() as tmpdir:

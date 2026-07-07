@@ -68,7 +68,8 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 - `oa_search_objects` 只做 OA 当前账号权限内的只读搜索；本地支持 `matchMode=keyword/contains/exact`，其中 `contains/exact` 会忽略标题空白。
 - `oa_search_objects` 默认 `requireDetail=true`，只返回可继续通过 `oa_get_object_detail` 查看详情的结果。
-- `oa_search_objects` 默认 `dedupByDocument=true`，按 `fdId` 聚合同一文档下的附件级命中，并返回 `normalizedTitle`、`type`、`attachmentCount`、`attachmentTitles`。
+- `oa_search_objects` 默认 `dedupByDocument=true`，按 `fdId` 聚合同一文档下的附件级命中，并返回 `normalizedTitle`、`type`、`attachmentCount`、`attachmentTitles`、`detailUrl`。
+- `detailUrl` 由当前 `baseUrl` 和受控站内 `recordRef.path` 拼接生成，仅用于浏览器打开 OA 原生详情页；下载附件仍必须通过详情页附件序号。
 - `oa_get_object_detail` 只接受搜索结果返回的 `recordRef`，并校验路径必须是站内相对路径。
 - `oa_download_attachment` 会重新读取详情页附件列表，只下载其中可见附件。
 - 附件保存时会清理文件名里的路径穿越字符，并默认避免覆盖已有文件。
