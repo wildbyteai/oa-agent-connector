@@ -1124,7 +1124,12 @@ class OAClient:
 
     def _looks_like_login_page(self, url: str, text: str) -> bool:
         lowered = (url + "\n" + text[:3000]).lower()
-        return ("j_acegi_security_check" in lowered) or ("j_username" in lowered and "j_password" in lowered)
+        return (
+            "login.jsp" in lowered
+            or "j_acegi_security_check" in lowered
+            or ("j_username" in lowered and "j_password" in lowered)
+            or re.search(r"<title[^>]*>\s*登录系统\s*</title>", text[:3000], re.I) is not None
+        )
 
     def _save_cookies(self) -> None:
         if self.cookie_file:

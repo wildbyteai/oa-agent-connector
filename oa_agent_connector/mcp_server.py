@@ -16,7 +16,7 @@ from .client import OAClient, OAConnectorError
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.2"
+SERVER_VERSION = "0.2.3"
 
 
 def _state_dir() -> Path:

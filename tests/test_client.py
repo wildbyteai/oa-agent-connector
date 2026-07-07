@@ -229,6 +229,17 @@ class FakeSearchClient(OAClient):
         return {"url": "https://example.invalid/oa/search", "text": json.dumps(self.payload, ensure_ascii=False)}
 
 
+class FakeSearchLoginClient(OAClient):
+    def __init__(self):
+        super().__init__("https://example.invalid/oa/")
+
+    def _request(self, path, method="GET", params=None, data=None):
+        return {
+            "url": "https://example.invalid/oa/sys/ftsearch/searchBuilder.do?method=search",
+            "text": "<!doctype html><html><head><title>登录系统</title></head><body></body></html>",
+        }
+
+
 class SearchObjectsTest(unittest.TestCase):
     def test_search_objects_parses_record_ref_and_exact_title(self):
         payload = {
@@ -471,6 +482,14 @@ class SearchObjectsTest(unittest.TestCase):
         self.assertEqual(item["createTime"], "2023-03-27")
         self.assertTrue(item["supportsDetail"])
         self.assertTrue(item["supportsAttachments"])
+
+    def test_search_objects_detects_login_system_html(self):
+        client = FakeSearchLoginClient()
+
+        with self.assertRaises(OAConnectorError) as ctx:
+            client.search_objects(query="出厂报告", scope="knowledge")
+
+        self.assertIn("当前会话未登录", str(ctx.exception))
 
 
 class FakeDetailClient(OAClient):
