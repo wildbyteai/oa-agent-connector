@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .client import OAClient, OAConnectorError
+from .credential_store import CredentialStoreError, SystemCredentialStore
 from .local_auth import begin_local_auth, read_local_auth_status, transport_security_issue
+from .security import sanitize_error_message
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.8"
+SERVER_VERSION = "0.2.9"
 
 
 def _state_dir() -> Path:
@@ -84,6 +86,11 @@ def _pending_path(token: str) -> Path:
     return _pending_dir() / f"{safe}.json"
 
 
+def _pending_claim_path(token: str) -> Path:
+    safe = "".join(ch for ch in token if ch.isalnum() or ch in ("-", "_"))
+    return _pending_dir() / f"{safe}.processing"
+
+
 def _transport_confirmation_dir() -> Path:
     return _state_dir() / "transport-confirmations"
 
@@ -93,18 +100,33 @@ def _transport_confirmation_path(token: str) -> Path:
     return _transport_confirmation_dir() / f"{safe}.json"
 
 
-def _save_session(session: str, base_url: str, login_account: str = "") -> None:
+def _auto_login_lock_path(session: str) -> Path:
+    return _state_dir() / "auto-login-locks" / f"{_safe_session_name(session)}.lock"
+
+
+def _write_session_meta(session: str, data: Dict[str, Any]) -> None:
     paths = _session_paths(session)
     _ensure_private_dir(paths["root"])
-    data = _saved_session_meta(session)
-    data["baseUrl"] = base_url
-    if login_account:
-        data["loginAccount"] = login_account
     paths["meta"].write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         paths["meta"].chmod(0o600)
     except OSError:
         pass
+
+
+def _save_session(
+    session: str,
+    base_url: str,
+    login_account: str = "",
+    auto_login_enabled: Optional[bool] = None,
+) -> None:
+    data = _saved_session_meta(session)
+    data["baseUrl"] = base_url
+    if login_account:
+        data["loginAccount"] = login_account
+    if auto_login_enabled is not None:
+        data["autoLoginEnabled"] = bool(auto_login_enabled)
+    _write_session_meta(session, data)
 
 
 def _load_base_url(session: str, base_url: Optional[str]) -> str:
@@ -134,6 +156,127 @@ def _client(session: str, base_url: Optional[str] = None, insecure: bool = False
         cookie_file=str(paths["cookie"]),
         verify_tls=not insecure,
     )
+
+
+def _auto_login_available(session: str) -> bool:
+    meta = _saved_session_meta(session)
+    return bool(meta.get("autoLoginEnabled") and meta.get("loginAccount"))
+
+
+def _block_auto_login(session: str, now: Optional[int] = None) -> None:
+    meta = _saved_session_meta(session)
+    failed_at = int(now if now is not None else time.time())
+    failure_count = int(meta.get("autoLoginFailureCount") or 0) + 1
+    meta["autoLoginLastFailedAt"] = failed_at
+    meta["autoLoginBlockedUntil"] = failed_at + 900
+    meta["autoLoginFailureCount"] = failure_count
+    if failure_count >= 3:
+        meta["autoLoginEnabled"] = False
+        meta["autoLoginRequiresManualAuth"] = True
+    meta.pop("autoLoginLastSucceededAt", None)
+    _write_session_meta(session, meta)
+
+
+def _try_auto_login(session: str) -> bool:
+    meta = _saved_session_meta(session)
+    if not meta.get("autoLoginEnabled"):
+        return False
+    username = str(meta.get("loginAccount") or "").strip()
+    base_url = str(meta.get("baseUrl") or "").strip()
+    if not username or not base_url:
+        return False
+    started_at = time.time()
+    now = int(started_at)
+    if int(meta.get("autoLoginBlockedUntil") or 0) > now:
+        return False
+    lock_path = _auto_login_lock_path(session)
+    _ensure_private_dir(lock_path.parent)
+    lock_token = secrets.token_urlsafe(16)
+    lock_acquired = False
+    saw_existing_lock = False
+    deadline = time.monotonic() + 65
+    while not lock_acquired:
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            saw_existing_lock = True
+            current = _saved_session_meta(session)
+            if float(current.get("autoLoginLastSucceededAt") or 0) > started_at:
+                return True
+            if int(current.get("autoLoginBlockedUntil") or 0) > int(time.time()):
+                return False
+            try:
+                if time.time() - lock_path.stat().st_mtime > 90:
+                    lock_path.unlink()
+                    saw_existing_lock = False
+                    continue
+            except OSError:
+                continue
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+            continue
+        try:
+            os.write(fd, lock_token.encode("ascii"))
+        finally:
+            os.close(fd)
+        lock_acquired = True
+
+    try:
+        if saw_existing_lock:
+            current = _saved_session_meta(session)
+            if float(current.get("autoLoginLastSucceededAt") or 0) > started_at:
+                return True
+            if int(current.get("autoLoginBlockedUntil") or 0) > int(time.time()):
+                return False
+        meta = _saved_session_meta(session)
+        username = str(meta.get("loginAccount") or "").strip()
+        base_url = str(meta.get("baseUrl") or "").strip()
+        if not meta.get("autoLoginEnabled") or not username or not base_url:
+            return False
+        password = SystemCredentialStore(namespace=str(_state_dir().resolve())).load(
+            base_url,
+            session,
+            username,
+        )
+        if not password:
+            raise CredentialStoreError("系统密码保险箱中没有可用登录信息")
+        insecure = bool(meta.get("autoLoginInsecure"))
+        _reject_https_tls_skip_without_admin(base_url, insecure)
+        client = OAClient(
+            base_url,
+            cookie_file=str(_session_paths(session)["cookie"]),
+            verify_tls=not insecure,
+        )
+        client.login(username, password)
+        client.assert_logged_in()
+    except Exception:
+        _block_auto_login(session, now=now)
+        return False
+    else:
+        meta.pop("autoLoginLastFailedAt", None)
+        meta.pop("autoLoginBlockedUntil", None)
+        meta.pop("autoLoginFailureCount", None)
+        meta.pop("autoLoginRequiresManualAuth", None)
+        meta["autoLoginLastSucceededAt"] = time.time()
+        _write_session_meta(session, meta)
+        return True
+    finally:
+        try:
+            if lock_path.read_text(encoding="ascii") == lock_token:
+                lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _can_retry_after_auto_login(tool_name: str) -> bool:
+    return tool_name not in {
+        "oa_setup_guide",
+        "oa_begin_auth",
+        "oa_local_auth_status",
+        "oa_login",
+        "oa_confirm_approval",
+    }
 
 
 def _absolute_url(base_url: str, path: str) -> str:
@@ -214,7 +357,7 @@ def _setup_guide(reason: str = "", session: str = "default") -> Dict[str, Any]:
             {
                 "step": 2,
                 "title": "授权登录",
-                "description": "优先调用 oa_begin_auth 生成本机授权页面，让用户在本机页面输入 OA 账号密码。密码不会保存，只保存登录 cookie。",
+                "description": "优先调用 oa_begin_auth 生成本机授权页面。用户可选择把登录信息安全保存在电脑自带的密码保险箱中，登录过期后自动恢复。",
                 **auth_action,
             },
             {
@@ -229,19 +372,9 @@ def _setup_guide(reason: str = "", session: str = "default") -> Dict[str, Any]:
 
 
 def _redact_tool_message(message: str) -> str:
-    text = str(message or "")
-    # Split on semicolons to handle multi-value headers like "Cookie: a=1; b=2"
-    parts = re.split(r";", text)
-    for i, part in enumerate(parts):
-        part = re.sub(
-            r"(?i)(cookie|set-cookie|jsessionid|authorization|password|j_password)\s*[:=]\s*\S.*",
-            r"\1=[redacted]",
-            part,
-        )
-        parts[i] = part
-    text = ";".join(parts)
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", text).strip()[:200]
+    if _auth_required_reason(message):
+        return "OA 登录状态不可用"
+    return sanitize_error_message(message)
 
 
 def _tool_error(message: str, session: str = "default") -> Dict[str, Any]:
@@ -266,6 +399,17 @@ def _approval_action_label(action: str) -> str:
 
 def _approval_confirm_phrase(action: str) -> str:
     return "确认审批" if action == "approve" else "确认驳回"
+
+
+def _approval_login_binding(session: str, base_url: str) -> str:
+    meta = _saved_session_meta(session)
+    login_account = str(meta.get("loginAccount") or "").strip()
+    if not login_account:
+        raise OAConnectorError("无法确认当前 OA 登录账号，请重新授权后再准备审批")
+    normalized_base_url = str(base_url or meta.get("baseUrl") or "").strip().rstrip("/").lower()
+    return hashlib.sha256(
+        f"{normalized_base_url}\n{session}\n{login_account}".encode("utf-8")
+    ).hexdigest()
 
 
 def _find_current_todo(client: OAClient, fd_id: str) -> Dict[str, Any]:
@@ -331,6 +475,8 @@ def _consume_transport_confirmation(token: str, session: str, base_url: str) -> 
 
 def _load_pending_approval(token: str) -> Dict[str, Any]:
     path = _pending_path(token)
+    if _pending_claim_path(token).exists():
+        raise OAConnectorError("这次审批确认正在处理或已经使用，请重新准备审批")
     if not path.exists():
         raise OAConnectorError("确认 token 不存在或已使用，请重新准备审批")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -343,11 +489,59 @@ def _load_pending_approval(token: str) -> Dict[str, Any]:
     return data
 
 
-def _delete_pending_approval(token: str) -> None:
+def _claim_pending_approval(token: str) -> Dict[str, Any]:
+    source = _pending_path(token)
+    claimed = _pending_claim_path(token)
+    _ensure_private_dir(claimed.parent)
     try:
-        _pending_path(token).unlink()
-    except OSError:
-        pass
+        fd = os.open(str(claimed), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise OAConnectorError("这次审批确认正在处理或已经使用，请重新准备审批") from exc
+    try:
+        try:
+            raw = source.read_bytes()
+        except FileNotFoundError as exc:
+            os.close(fd)
+            fd = -1
+            try:
+                claimed.unlink()
+            except OSError:
+                pass
+            raise OAConnectorError("确认 token 不存在或已使用，请重新准备审批") from exc
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            source.unlink()
+        except OSError:
+            pass
+        data = json.loads(raw.decode("utf-8"))
+        if int(time.time()) > int(data.get("expiresAt") or 0):
+            try:
+                claimed.unlink()
+            except OSError:
+                pass
+            raise OAConnectorError("确认 token 已过期，请重新准备审批")
+        return data
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        if source.exists():
+            try:
+                claimed.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _delete_pending_approval(token: str) -> None:
+    for path in (_pending_path(token), _pending_claim_path(token)):
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _tool_schema(name: str, description: str, properties: Dict[str, Any], required: Optional[list[str]] = None) -> Dict[str, Any]:
@@ -388,7 +582,7 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_begin_auth",
-        "启动只监听 127.0.0.1 的本机 OA 授权页面，返回可点击 authUrl。用户在本机页面输入账号密码，MCP 只保存登录 cookie，不保存密码。",
+        "启动只监听 127.0.0.1 的本机 OA 授权页面，返回可点击 authUrl。密码不进入聊天或连接器文件；用户可选择存入系统密码保险箱，用于登录过期后自动恢复。",
         {
             "baseUrl": {"type": "string", "description": "OA 根地址；不传则使用已配置 OA_BASE_URL 或当前 session 保存的地址"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},
@@ -404,6 +598,13 @@ TOOLS = [
             "authToken": {"type": "string"},
         },
         ["authToken"],
+    ),
+    _tool_schema(
+        "oa_disable_auto_login",
+        "关闭当前 OA 会话的自动登录。只删除系统密码保险箱中的登录信息，保留当前 cookie。",
+        {
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+        },
     ),
     _tool_schema(
         "oa_auth_status",
@@ -705,6 +906,27 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "oa_local_auth_status":
         return _ok(read_local_auth_status(str(_state_dir()), str(args["authToken"])))
 
+    if name == "oa_disable_auto_login":
+        meta = _saved_session_meta(session)
+        base_url = str(meta.get("baseUrl") or "")
+        username = str(meta.get("loginAccount") or "")
+        if meta.get("autoLoginEnabled") or meta.get("credentialCleanupFailed"):
+            SystemCredentialStore(namespace=str(_state_dir().resolve())).delete(
+                base_url,
+                session,
+                username,
+            )
+        meta["autoLoginEnabled"] = False
+        meta["autoLoginInsecure"] = False
+        meta["credentialCleanupFailed"] = False
+        meta.pop("autoLoginLastFailedAt", None)
+        meta.pop("autoLoginBlockedUntil", None)
+        meta.pop("autoLoginLastSucceededAt", None)
+        meta.pop("autoLoginFailureCount", None)
+        meta.pop("autoLoginRequiresManualAuth", None)
+        _write_session_meta(session, meta)
+        return _ok({"ok": True, "session": session, "autoLoginEnabled": False, "cookiePreserved": True})
+
     if name == "oa_login":
         if not _password_login_enabled():
             raise OAConnectorError("oa_login 默认禁用。请使用 oa_begin_auth 生成本机授权页面，避免在聊天里输入 OA 密码")
@@ -722,12 +944,39 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         confirmation_text = str(args["confirmationText"]).strip()
         if confirmation_text != expected:
             raise OAConnectorError(f"确认文本不匹配：需要用户明确发送“{expected}”")
+        pending = _claim_pending_approval(token)
+        expected = _approval_confirm_phrase(str(pending["action"]))
+        if confirmation_text != expected:
+            raise OAConnectorError(f"确认文本不匹配：需要用户明确发送“{expected}”")
+        pending_session = str(pending["session"])
+        current_binding = _approval_login_binding(pending_session, str(pending["baseUrl"]))
+        if not pending.get("loginBinding") or pending["loginBinding"] != current_binding:
+            raise OAConnectorError("OA 登录账号已变化，请重新准备审批并再次确认")
         confirm_client = _client(
-            session=str(pending["session"]),
+            session=pending_session,
             base_url=str(pending["baseUrl"]),
             insecure=bool(pending.get("insecure")),
         )
-        _find_current_todo(confirm_client, str(pending["fdId"]))
+        try:
+            _find_current_todo(confirm_client, str(pending["fdId"]))
+        except Exception as exc:
+            if not (
+                _auth_required_reason(str(exc))
+                and _auto_login_available(pending_session)
+                and _try_auto_login(pending_session)
+            ):
+                raise
+            confirm_client = _client(
+                session=pending_session,
+                base_url=str(pending["baseUrl"]),
+                insecure=bool(pending.get("insecure")),
+            )
+            try:
+                _find_current_todo(confirm_client, str(pending["fdId"]))
+            except Exception as retry_exc:
+                if _auth_required_reason(str(retry_exc)):
+                    _block_auto_login(pending_session)
+                raise
         if pending["action"] == "approve":
             result = confirm_client.approve(
                 str(pending["fdId"]),
@@ -795,6 +1044,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
         if name == "oa_batch_search_objects":
+            client.assert_logged_in()
             batch_args = dict(args)
             queries = list(batch_args.pop("queries"))
             batch_args.pop("session", None)
@@ -812,6 +1062,9 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         status["session"] = session
         status["baseUrl"] = client.base_url
         meta = _saved_session_meta(session)
+        status["autoLoginEnabled"] = bool(meta.get("autoLoginEnabled"))
+        status["autoLoginCleanupRequired"] = bool(meta.get("credentialCleanupFailed"))
+        status["autoLoginRequiresManualAuth"] = bool(meta.get("autoLoginRequiresManualAuth"))
         if not status.get("loginAs") and meta.get("loginAccount"):
             status["loginAs"] = str(meta["loginAccount"])
             status["identityAvailable"] = True
@@ -849,6 +1102,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "action": action,
             "note": note,
             "futureNodeId": args.get("futureNodeId"),
+            "loginBinding": _approval_login_binding(session, base_url),
         }
         token = _save_pending_approval(pending)
         summary = {
@@ -933,10 +1187,25 @@ def handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return _response(message_id, {"tools": _listed_tools()})
         if method == "tools/call":
             tool_args = dict(params.get("arguments") or {})
+            tool_name = str(params["name"])
             try:
-                result = call_tool(str(params["name"]), tool_args)
+                result = call_tool(tool_name, tool_args)
             except Exception as exc:
-                result = _tool_error(str(exc), session=_session(tool_args))
+                session = _session(tool_args)
+                if (
+                    _can_retry_after_auto_login(tool_name)
+                    and _auth_required_reason(str(exc))
+                    and _auto_login_available(session)
+                    and _try_auto_login(session)
+                ):
+                    try:
+                        result = call_tool(tool_name, tool_args)
+                    except Exception as retry_exc:
+                        if _auth_required_reason(str(retry_exc)):
+                            _block_auto_login(session)
+                        result = _tool_error(str(retry_exc), session=session)
+                else:
+                    result = _tool_error(str(exc), session=session)
             return _response(message_id, result)
         return _response(message_id, error={"code": -32601, "message": f"Method not found: {method}"})
     except Exception as exc:

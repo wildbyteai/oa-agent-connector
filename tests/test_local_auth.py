@@ -15,6 +15,182 @@ from oa_agent_connector import local_auth
 
 
 class LocalAuthTest(unittest.TestCase):
+    def test_error_redaction_hides_json_and_url_encoded_passwords(self):
+        messages = [
+            '{"password":"json-secret"}',
+            "j_password%3Dencoded-secret%26username%3Du001",
+            "%22password%22%3A%22encoded-json-secret%22",
+        ]
+
+        for message in messages:
+            with self.subTest(message=message):
+                redacted = local_auth._redact_error(message)
+                self.assertIn("敏感内容已隐藏", redacted)
+                self.assertNotIn("secret", redacted)
+
+    def test_local_auth_can_store_credential_for_automatic_relogin(self):
+        seen = {}
+
+        class FakeAuthClient:
+            def __init__(self, base_url, cookie_file=None, verify_tls=True):
+                self.cookie_file = cookie_file
+
+            def login(self, username, password):
+                Path(self.cookie_file).write_text("cookie", encoding="utf-8")
+                return True
+
+        class FakeCredentialStore:
+            def save(self, base_url, session, username, password):
+                seen.update(
+                    {
+                        "base_url": base_url,
+                        "session": session,
+                        "username": username,
+                        "password": password,
+                    }
+                )
+
+            def delete(self, base_url, session, username):
+                raise AssertionError("remembered login should overwrite the session credential")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token = "remember-token"
+            status_file = Path(tmpdir) / "local-auth" / "remember-token.json"
+            thread = threading.Thread(
+                target=local_auth.serve_local_auth,
+                kwargs={
+                    "base_url": "https://example.invalid/oa/",
+                    "session": "work",
+                    "state_dir": tmpdir,
+                    "token": token,
+                    "port": 0,
+                    "expires_in": 120,
+                    "status_file": str(status_file),
+                    "client_factory": FakeAuthClient,
+                    "credential_store": FakeCredentialStore(),
+                },
+                daemon=True,
+            )
+            thread.start()
+
+            deadline = time.time() + 5
+            status = {}
+            while time.time() < deadline:
+                if status_file.exists():
+                    status = json.loads(status_file.read_text(encoding="utf-8"))
+                    if status.get("authUrl"):
+                        break
+                time.sleep(0.05)
+
+            page = urllib.request.urlopen(status["authUrl"], timeout=3).read().decode("utf-8")
+            self.assertIn("登录过期后自动登录", page)
+            self.assertIn('name="rememberCredential"', page)
+
+            form = urllib.parse.urlencode(
+                {
+                    "state": token,
+                    "username": "u001",
+                    "password": "secret-password",
+                    "rememberCredential": "1",
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                status["authUrl"],
+                data=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            response = urllib.request.urlopen(request, timeout=5).read().decode("utf-8")
+            self.assertIn("授权成功", response)
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+
+            self.assertEqual(seen["base_url"], "https://example.invalid/oa/")
+            self.assertEqual(seen["session"], "work")
+            self.assertEqual(seen["username"], "u001")
+            self.assertEqual(seen["password"], "secret-password")
+
+            paths = local_auth._session_paths(tmpdir, "work")
+            metadata = json.loads(paths["meta"].read_text(encoding="utf-8"))
+            final_status = json.loads(status_file.read_text(encoding="utf-8"))
+            self.assertTrue(metadata["autoLoginEnabled"])
+            self.assertTrue(final_status["autoLoginEnabled"])
+            persisted = (
+                status_file.read_text(encoding="utf-8")
+                + paths["cookie"].read_text(encoding="utf-8")
+                + paths["meta"].read_text(encoding="utf-8")
+            )
+            self.assertNotIn("secret-password", persisted)
+
+    def test_unchecking_remember_reports_system_credential_cleanup_failure(self):
+        class FakeAuthClient:
+            def __init__(self, base_url, cookie_file=None, verify_tls=True):
+                self.cookie_file = cookie_file
+
+            def login(self, username, password):
+                Path(self.cookie_file).write_text("cookie", encoding="utf-8")
+                return True
+
+        class FailingCredentialStore:
+            def delete(self, base_url, session, username):
+                raise local_auth.CredentialStoreError("vault locked")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_auth._save_session(
+                tmpdir,
+                "work",
+                "https://example.invalid/oa/",
+                login_account="u001",
+                auto_login_enabled=True,
+            )
+            token = "cleanup-token"
+            status_file = Path(tmpdir) / "local-auth" / "cleanup-token.json"
+            thread = threading.Thread(
+                target=local_auth.serve_local_auth,
+                kwargs={
+                    "base_url": "https://example.invalid/oa/",
+                    "session": "work",
+                    "state_dir": tmpdir,
+                    "token": token,
+                    "port": 0,
+                    "expires_in": 120,
+                    "status_file": str(status_file),
+                    "client_factory": FakeAuthClient,
+                    "credential_store": FailingCredentialStore(),
+                },
+                daemon=True,
+            )
+            thread.start()
+
+            deadline = time.time() + 5
+            status = {}
+            while time.time() < deadline:
+                if status_file.exists():
+                    status = json.loads(status_file.read_text(encoding="utf-8"))
+                    if status.get("authUrl"):
+                        break
+                time.sleep(0.05)
+
+            form = urllib.parse.urlencode(
+                {"state": token, "username": "u001", "password": "secret-password"}
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                status["authUrl"],
+                data=form,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            response = urllib.request.urlopen(request, timeout=5).read().decode("utf-8")
+            thread.join(timeout=5)
+
+            metadata = json.loads(local_auth._session_paths(tmpdir, "work")["meta"].read_text(encoding="utf-8"))
+            final_status = json.loads(status_file.read_text(encoding="utf-8"))
+
+        self.assertIn("未能清理", response)
+        self.assertFalse(metadata["autoLoginEnabled"])
+        self.assertTrue(metadata["credentialCleanupFailed"])
+        self.assertTrue(final_status["credentialCleanupFailed"])
+
     def test_local_auth_page_logs_in_without_persisting_password(self):
         seen = {}
 

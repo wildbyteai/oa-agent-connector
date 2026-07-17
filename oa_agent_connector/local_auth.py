@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .client import OAClient
+from .credential_store import CredentialStoreError, SystemCredentialStore
+from .security import sanitize_error_message
 
 
 ClientFactory = Callable[..., OAClient]
@@ -107,12 +109,42 @@ def _ensure_private_dir(path: Path) -> None:
         pass
 
 
-def _save_session(state_dir: str, session: str, base_url: str, login_account: str = "") -> None:
+def _load_session_meta(state_dir: str, session: str) -> Dict[str, Any]:
+    meta_path = _session_paths(state_dir, session)["meta"]
+    if not meta_path.exists():
+        return {}
+    try:
+        value = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _save_session(
+    state_dir: str,
+    session: str,
+    base_url: str,
+    login_account: str = "",
+    auto_login_enabled: Optional[bool] = None,
+    auto_login_insecure: Optional[bool] = None,
+    credential_cleanup_failed: Optional[bool] = None,
+) -> None:
     paths = _session_paths(state_dir, session)
     _ensure_private_dir(paths["root"])
-    data: Dict[str, Any] = {"baseUrl": base_url}
+    data = _load_session_meta(state_dir, session)
+    data["baseUrl"] = base_url
     if login_account:
         data["loginAccount"] = login_account
+    if auto_login_enabled is not None:
+        data["autoLoginEnabled"] = bool(auto_login_enabled)
+    if auto_login_insecure is not None:
+        data["autoLoginInsecure"] = bool(auto_login_insecure)
+    if credential_cleanup_failed is not None:
+        data["credentialCleanupFailed"] = bool(credential_cleanup_failed)
+    data.pop("autoLoginLastFailedAt", None)
+    data.pop("autoLoginBlockedUntil", None)
+    data.pop("autoLoginFailureCount", None)
+    data.pop("autoLoginRequiresManualAuth", None)
     paths["meta"].write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         paths["meta"].chmod(0o600)
@@ -145,14 +177,7 @@ def _write_json(path: Path, data: Dict[str, Any]) -> None:
 
 
 def _redact_error(message: str) -> str:
-    text = str(message or "")
-    text = re.sub(
-        r"(?i)(cookie|set-cookie|jsessionid|authorization|password|j_password)\s*[:=]\s*\S.*",
-        r"\1=[redacted]",
-        text,
-    )
-    text = re.sub(r"<[^>]+>", " ", text)
-    return re.sub(r"\s+", " ", text).strip()[:200]
+    return sanitize_error_message(message)
 
 
 def read_local_auth_status(state_dir: str, token: str) -> Dict[str, Any]:
@@ -209,7 +234,7 @@ def _html_page(title: str, body: str) -> bytes:
     h1 {{ font-size: 22px; margin: 0 0 16px; }}
     p {{ line-height: 1.55; }}
     label {{ display: block; margin: 14px 0 6px; font-weight: 600; }}
-    input {{
+    input:not([type="checkbox"]) {{
       box-sizing: border-box;
       width: 100%;
       padding: 10px 12px;
@@ -230,6 +255,16 @@ def _html_page(title: str, body: str) -> bytes:
       cursor: pointer;
     }}
     .muted {{ color: #57606a; font-size: 14px; }}
+    .remember {{
+      display: grid;
+      grid-template-columns: 20px 1fr;
+      gap: 8px;
+      align-items: start;
+      margin-top: 16px;
+      font-weight: 400;
+    }}
+    .remember input {{ margin-top: 3px; }}
+    .remember span {{ line-height: 1.45; }}
     .error {{ color: #b42318; }}
     .success {{ color: #1a7f37; }}
     code {{ word-break: break-all; }}
@@ -248,7 +283,7 @@ def _form_html(base_url: str, session: str, token: str, error: str = "", insecur
         warning_html = '<p class="error">请确认这是公司 OA 登录页面，再输入账号和密码。</p>'
     body = f"""
 <h1>OA 授权登录</h1>
-<p class="muted">请在本机页面输入 OA 账号和密码。密码只用于本次登录，不会保存，也不会写入聊天记录。若浏览器询问是否保存密码，请选择不保存。</p>
+<p class="muted">请在本机页面输入 OA 账号和密码。密码不会写入聊天记录或连接器文件。</p>
 {warning_html}
 {error_html}
 <form method="post" action="/authorize" autocomplete="off">
@@ -261,6 +296,10 @@ def _form_html(base_url: str, session: str, token: str, error: str = "", insecur
   <input id="username" name="username" autocomplete="off" required autofocus>
   <label for="password">OA 密码</label>
   <input id="password" name="password" type="password" autocomplete="off" required>
+  <label class="remember">
+    <input name="rememberCredential" type="checkbox" value="1" checked>
+    <span>在这台电脑上安全记住，登录过期后自动登录。登录信息保存在系统密码保险箱；共用电脑请取消勾选。</span>
+  </label>
   <button type="submit">授权登录</button>
 </form>"""
     return _html_page("OA 授权登录", body)
@@ -286,6 +325,7 @@ def serve_local_auth(
     status_file: Optional[str] = None,
     insecure: bool = False,
     client_factory: ClientFactory = OAClient,
+    credential_store: Optional[Any] = None,
 ) -> int:
     _validate_auth_transport(base_url, insecure)
     expires_in = max(60, min(int(expires_in), 1800))
@@ -340,13 +380,50 @@ def serve_local_auth(
                 return
             username = (form.get("username") or [""])[0].strip()
             password = (form.get("password") or [""])[0]
+            remember_credential = (form.get("rememberCredential") or [""])[0] == "1"
             if not username or not password:
                 self._send(400, _form_html(base_url, session, token, "请填写 OA 账号和密码。", insecure=insecure))
                 return
             try:
+                previous = _load_session_meta(state_dir, session)
                 client = client_factory(base_url, cookie_file=str(paths["cookie"]), verify_tls=not insecure)
                 client.login(username, password)
-                _save_session(state_dir, session, base_url, login_account=username)
+                auto_login_enabled = False
+                auto_login_message = "OA 授权已完成。"
+                credential_cleanup_failed = False
+                store = credential_store
+                if remember_credential:
+                    try:
+                        store = store or SystemCredentialStore(namespace=str(Path(state_dir).expanduser().resolve()))
+                        store.save(base_url, session, username, password)
+                        auto_login_enabled = True
+                        auto_login_message = "OA 授权已完成，登录过期后会自动恢复。"
+                    except CredentialStoreError:
+                        auto_login_message = "OA 授权已完成，但这台电脑无法安全保存登录信息；过期后需要重新授权。"
+                        if previous.get("autoLoginEnabled") or previous.get("credentialCleanupFailed"):
+                            try:
+                                store = store or SystemCredentialStore(namespace=str(Path(state_dir).expanduser().resolve()))
+                                store.delete(base_url, session, str(previous.get("loginAccount") or username))
+                            except CredentialStoreError:
+                                credential_cleanup_failed = True
+                else:
+                    previous_account = str(previous.get("loginAccount") or username)
+                    if previous.get("autoLoginEnabled") or previous.get("credentialCleanupFailed"):
+                        try:
+                            store = store or SystemCredentialStore(namespace=str(Path(state_dir).expanduser().resolve()))
+                            store.delete(base_url, session, previous_account)
+                        except CredentialStoreError:
+                            credential_cleanup_failed = True
+                            auto_login_message = "OA 授权已完成，自动登录已关闭，但系统密码保险箱中的旧信息未能清理。请回到 Agent 说“关闭 OA 自动登录”重试。"
+                _save_session(
+                    state_dir,
+                    session,
+                    base_url,
+                    login_account=username,
+                    auto_login_enabled=auto_login_enabled,
+                    auto_login_insecure=insecure if auto_login_enabled else False,
+                    credential_cleanup_failed=credential_cleanup_failed,
+                )
                 _write_json(
                     status_path,
                     {
@@ -355,11 +432,13 @@ def serve_local_auth(
                         "authToken": token,
                         "session": session,
                         "baseUrl": base_url,
+                        "autoLoginEnabled": auto_login_enabled,
+                        "credentialCleanupFailed": credential_cleanup_failed,
                         "completedAt": int(time.time()),
                     },
                 )
                 setattr(self.server, "finished", True)
-                self._send(200, _message_html("授权成功", "OA 授权已完成。", success=True))
+                self._send(200, _message_html("授权成功", auto_login_message, success=True))
             except Exception as exc:
                 _write_json(
                     status_path,

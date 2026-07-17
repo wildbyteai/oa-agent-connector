@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oa-agent-connector"
-version = "0.2.8"
+version = "0.2.9"
 description = "Agent-side OA MCP connector using existing OA endpoints"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["keyring>=24.3,<26"]
 readme = "README.md"
 
 [project.scripts]

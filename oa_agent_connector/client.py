@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
 
+from .security import sanitize_error_message
+
 
 FD_ID_RE = re.compile(r"\bfdId[=/]([0-9a-fA-F]{24,40})")
 FD_ID_VALUE_RE = re.compile(r"""(?:["']?fdId["']?\s*[:=]\s*["']|value=["'])([0-9a-fA-F]{24,40})""")
@@ -829,33 +831,7 @@ class OAClient:
                 "payload": payload,
                 "permissionGate": "fdId was present in current session's type=unExecuted list",
             }
-
-        try:
-            response = self._request(endpoint, method="POST", data=payload)
-        except OAConnectorError as exc:
-            if self._should_fallback_to_ui_form(exc):
-                return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
-            raise
-        except TimeoutError:
-            return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
-        text = response["text"].strip()
-        if text == fd_id:
-            self._save_cookies()
-            return {"dryRun": False, "fdId": fd_id, "result": text, "transport": "rest"}
-
-        if "Unauthorized" in text or "HTTP 401" in text:
-            return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
-        raise OAConnectorError(f"审批接口返回异常: {text[:500]}")
-
-    def _should_fallback_to_ui_form(self, exc: OAConnectorError) -> bool:
-        message = str(exc)
-        lowered = message.lower()
-        return (
-            "HTTP 401" in message
-            or "Unauthorized" in message
-            or "timeout" in lowered
-            or "timed out" in lowered
-        )
+        return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
 
     def _approval_action_via_ui(
         self,
@@ -1398,14 +1374,7 @@ class OAClient:
         }
 
     def _sanitize_error(self, exc: Exception) -> str:
-        text = str(exc)
-        text = re.sub(
-            r"(?i)(?:cookie|set-cookie|jsessionid|authorization|password|j_password)\s*[:=][^\s,;]+",
-            "[redacted]",
-            text,
-        )
-        text = re.sub(r"<[^>]+>", " ", text)
-        return re.sub(r"\s+", " ", text).strip()[:200]
+        return sanitize_error_message(exc)
 
     def download_attachment(
         self,

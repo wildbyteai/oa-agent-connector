@@ -4,7 +4,7 @@
 
 - 登录：`POST /j_acegi_security_check`
 - 待我审列表：`GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval&mydoc=approval`
-- 审批处理：`POST /api/km-review/kmReviewRestService/approveProcess`
+- 审批处理：先读取现有编辑表单，再通过 `POST /km/review/km_review_main/kmReviewMain.do?method=update` 提交
 - 详情查看：`GET /km/review/km_review_main/kmReviewMain.do?method=view&fdId=...`
 - 通用搜索：`GET /sys/ftsearch/searchBuilder.do?method=search&resultType=json`
 - 文档详情：基于搜索结果返回的受控 `recordRef.path`
@@ -19,6 +19,8 @@
 3. 只有 `fdId` 在当前待审列表中才允许提交审批接口。
 4. 连接器不接受也不传入任意 `handler`，避免绕过当前登录账号权限。
 5. `approve` / `reject` 默认 dry-run，只有显式 `--execute` 才会真正提交。
+
+MCP 正式审批还增加两层保护：确认令牌会被单个进程原子占用，并绑定准备审批时的 OA 登录账号。审批只使用页面表单这一条提交路径，不会在请求超时后自动改用另一条路径再次提交。
 
 ## 用法
 
@@ -40,7 +42,7 @@ MCP 模式建议始终配置 `OA_AGENT_STATE_DIR` 为目标电脑上的真实绝
 - macOS/Linux：当前用户主目录下的 `.oa-agent-connector`
 - Windows：当前用户目录下的 `.oa-agent-connector`
 
-这个目录用于保存 MCP 登录 cookie、OA 地址和审批确认状态，确保不同 MCP 调用能读写同一份状态。
+这个目录用于保存 MCP 登录 Cookie、OA 地址和审批确认状态，确保不同 MCP 调用能读写同一份状态。自动登录密码不写入这个目录。
 
 可用下面的命令在目标电脑上生成 MCP 配置：
 
@@ -50,12 +52,15 @@ oa-agent-mcp-config --base-url "<OA_BASE_URL>"
 
 MCP 普通授权默认使用 `oa_begin_auth` 本机授权页。`oa_login` 默认不暴露给普通 Agent；只有管理员显式设置 `OA_AGENT_ENABLE_PASSWORD_LOGIN=1` 时才开放。`oa_begin_auth` 默认优先要求 OA 地址为 HTTPS；如果企业内网 OA 只能 HTTP，MCP 会先返回安全确认提示、一次性确认令牌和 `nextAction`，用户确认后 Agent 再调用 `oa_begin_auth(insecure=true)` 继续授权，不需要用户手动改配置或重启。HTTPS 跳过证书校验不走普通用户确认流程，仍需管理员显式设置 `OA_AGENT_ALLOW_INSECURE_AUTH=1`。该环境变量仅作为管理员预先批准可信内网 HTTP 或 HTTPS 跳过证书校验的全局例外。
 
+用户在本机授权页勾选“在这台电脑上安全记住”后，密码通过 `keyring` 保存到 macOS 钥匙串或 Windows 凭据管理器。Keyring 服务标识同时绑定 `OA_AGENT_STATE_DIR` 和 session，避免同一电脑上的多套连接器互相覆盖。MCP 检测到明确的登录失效时，会自动登录并把只读操作重试一次；审批确认只在执行前的待办权限复核阶段自动恢复，不会自动重放审批提交。失败后默认冷却 15 分钟，连续失败 3 次后停止自动登录并要求重新授权。`oa_disable_auto_login` 可删除系统凭据并保留当前 Cookie。
+
 ## Agent 工具封装建议
 
 对外暴露工具时建议只暴露以下动作：
 
 - `begin_auth(base_url)`：默认授权入口，返回本机授权链接
 - `local_auth_status(auth_token)`
+- `disable_auto_login()`：删除系统密码保险箱中的登录信息，保留当前 Cookie
 - `login(base_url, username, password)`：兼容或调试入口，默认不暴露；不建议普通用户在聊天里输入密码
 - `list_todos(page, page_size)`
 - `get_detail(fd_id)`

@@ -1,6 +1,8 @@
 import json
 import re
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -47,6 +49,440 @@ class ExpiredAuthClient(FakeClient):
 
 
 class MCPServerTest(unittest.TestCase):
+    def test_expired_cookie_automatically_relogs_in_and_retries_read(self):
+        calls = {"login": 0, "load": 0}
+
+        class AutoReloginClient(FakeClient):
+            def login(self, username, password):
+                calls["login"] += 1
+                if username != "u001" or password != "stored-secret":
+                    raise AssertionError("unexpected stored credential")
+                Path(self.cookie_file).write_text("refreshed-cookie", encoding="utf-8")
+                return True
+
+            def list_todos(self, page=1, page_size=20):
+                cookie_path = Path(self.cookie_file)
+                if not cookie_path.exists() or cookie_path.read_text(encoding="utf-8") != "refreshed-cookie":
+                    raise RuntimeError("当前 cookie 未登录或已失效，请先 login")
+                return super().list_todos(page=page, page_size=page_size)
+
+        class FakeCredentialStore:
+            def load(self, base_url, session, username):
+                calls["load"] += 1
+                if base_url != "https://example.invalid/oa/" or session != "work" or username != "u001":
+                    raise AssertionError("unexpected credential lookup")
+                return "stored-secret"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                meta_path = mcp_server._session_paths("work")["meta"]
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                metadata["autoLoginEnabled"] = True
+                meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+                with patch.object(mcp_server, "OAClient", AutoReloginClient):
+                    with patch("oa_agent_connector.mcp_server.SystemCredentialStore", return_value=FakeCredentialStore()):
+                        response = mcp_server.handle(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "oa_list_todos",
+                                    "arguments": {"session": "work"},
+                                },
+                            }
+                        )
+
+        self.assertFalse(response["result"].get("isError", False))
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["items"][0]["subject"], "采购审批")
+        self.assertEqual(calls, {"login": 1, "load": 1})
+        self.assertNotIn("stored-secret", json.dumps(response, ensure_ascii=False))
+
+    def test_confirm_approval_relogs_in_before_permission_check_and_executes_once(self):
+        calls = {"login": 0, "reject": 0}
+
+        class ConfirmReloginClient(FakeClient):
+            def login(self, username, password):
+                calls["login"] += 1
+                if username != "u001" or password != "stored-secret":
+                    raise AssertionError("unexpected stored credential")
+                Path(self.cookie_file).write_text("refreshed-cookie", encoding="utf-8")
+                return True
+
+            def list_todos(self, page=1, page_size=20):
+                cookie_path = Path(self.cookie_file)
+                if not cookie_path.exists() or cookie_path.read_text(encoding="utf-8") != "refreshed-cookie":
+                    raise RuntimeError("当前 cookie 未登录或已失效，请先 login")
+                return super().list_todos(page=page, page_size=page_size)
+
+            def reject(self, fd_id, audit_note, execute=False):
+                calls["reject"] += 1
+                return {"dryRun": not execute, "fdId": fd_id, "result": "rejected"}
+
+        class FakeCredentialStore:
+            def load(self, base_url, session, username):
+                return "stored-secret"
+
+        fd_id = "1234567890abcdef1234567890abcdef"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                    auto_login_enabled=True,
+                )
+                token = mcp_server._save_pending_approval(
+                    {
+                        "session": "work",
+                        "baseUrl": "https://example.invalid/oa/",
+                        "insecure": False,
+                        "fdId": fd_id,
+                        "action": "reject",
+                        "note": "资料不完整",
+                        "futureNodeId": None,
+                        "loginBinding": mcp_server._approval_login_binding(
+                            "work",
+                            "https://example.invalid/oa/",
+                        ),
+                    }
+                )
+                with patch.object(mcp_server, "OAClient", ConfirmReloginClient):
+                    with patch("oa_agent_connector.mcp_server.SystemCredentialStore", return_value=FakeCredentialStore()):
+                        response = mcp_server.handle(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "oa_confirm_approval",
+                                    "arguments": {
+                                        "confirmationToken": token,
+                                        "confirmationText": "确认驳回",
+                                    },
+                                },
+                            }
+                        )
+
+        self.assertFalse(response["result"].get("isError", False))
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["executed"])
+        self.assertEqual(calls, {"login": 1, "reject": 1})
+
+    def test_confirmation_token_can_only_be_claimed_by_one_process(self):
+        calls = {"reject": 0}
+        calls_lock = threading.Lock()
+
+        class CountingClient(FakeClient):
+            def reject(self, fd_id, audit_note, execute=False):
+                with calls_lock:
+                    calls["reject"] += 1
+                return {"dryRun": not execute, "fdId": fd_id, "result": "rejected"}
+
+        fd_id = "1234567890abcdef1234567890abcdef"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                token = mcp_server._save_pending_approval(
+                    {
+                        "session": "work",
+                        "baseUrl": "https://example.invalid/oa/",
+                        "insecure": False,
+                        "fdId": fd_id,
+                        "action": "reject",
+                        "note": "资料不完整",
+                        "futureNodeId": None,
+                        "loginBinding": mcp_server._approval_login_binding(
+                            "work",
+                            "https://example.invalid/oa/",
+                        ),
+                    }
+                )
+                original_load = mcp_server._load_pending_approval
+                load_barrier = threading.Barrier(2)
+
+                def synchronized_load(value):
+                    pending = original_load(value)
+                    load_barrier.wait(timeout=5)
+                    return pending
+
+                responses = []
+
+                def confirm(message_id):
+                    responses.append(
+                        mcp_server.handle(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": message_id,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "oa_confirm_approval",
+                                    "arguments": {
+                                        "confirmationToken": token,
+                                        "confirmationText": "确认驳回",
+                                    },
+                                },
+                            }
+                        )
+                    )
+
+                with patch.object(mcp_server, "OAClient", CountingClient):
+                    with patch.object(mcp_server, "_load_pending_approval", side_effect=synchronized_load):
+                        threads = [threading.Thread(target=confirm, args=(message_id,)) for message_id in (1, 2)]
+                        for thread in threads:
+                            thread.start()
+                        for thread in threads:
+                            thread.join(timeout=5)
+                            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(calls["reject"], 1)
+        self.assertEqual(sum(not response["result"].get("isError", False) for response in responses), 1)
+
+    def test_confirmation_is_rejected_after_switching_login_account(self):
+        calls = {"reject": 0}
+
+        class CountingClient(FakeClient):
+            def reject(self, fd_id, audit_note, execute=False):
+                calls["reject"] += 1
+                return {"dryRun": not execute, "fdId": fd_id}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", CountingClient):
+                    prepared = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_prepare_approval",
+                                "arguments": {
+                                    "fdId": "1234567890abcdef1234567890abcdef",
+                                    "action": "reject",
+                                    "note": "资料不完整",
+                                    "session": "work",
+                                },
+                            },
+                        }
+                    )
+                    prepared_payload = json.loads(prepared["result"]["content"][0]["text"])
+                    mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u002")
+                    confirmed = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_confirm_approval",
+                                "arguments": {
+                                    "confirmationToken": prepared_payload["confirmationToken"],
+                                    "confirmationText": "确认驳回",
+                                },
+                            },
+                        }
+                    )
+
+        self.assertTrue(confirmed["result"]["isError"])
+        payload = json.loads(confirmed["result"]["content"][0]["text"])
+        self.assertIn("登录账号已变化", payload["reason"])
+        self.assertEqual(calls["reject"], 0)
+
+    def test_failed_automatic_relogin_uses_cooldown_to_avoid_account_lockout(self):
+        calls = {"login": 0, "load": 0}
+
+        class FailedReloginClient(ExpiredAuthClient):
+            def login(self, username, password):
+                calls["login"] += 1
+                raise RuntimeError("登录失败或仍停留在登录页")
+
+        class FakeCredentialStore:
+            def load(self, base_url, session, username):
+                calls["load"] += 1
+                return "stale-secret"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                    auto_login_enabled=True,
+                )
+                with patch.object(mcp_server, "OAClient", FailedReloginClient):
+                    with patch("oa_agent_connector.mcp_server.SystemCredentialStore", return_value=FakeCredentialStore()):
+                        responses = [
+                            mcp_server.handle(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": message_id,
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": "oa_list_todos",
+                                        "arguments": {"session": "work"},
+                                    },
+                                }
+                            )
+                            for message_id in (1, 2)
+                        ]
+                metadata = json.loads(mcp_server._session_paths("work")["meta"].read_text(encoding="utf-8"))
+
+        self.assertEqual(calls, {"login": 1, "load": 1})
+        self.assertGreater(metadata["autoLoginBlockedUntil"], metadata["autoLoginLastFailedAt"])
+        for response in responses:
+            self.assertTrue(response["result"]["isError"])
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertTrue(payload["reauthRequired"])
+            self.assertNotIn("stale-secret", json.dumps(response, ensure_ascii=False))
+
+    def test_automatic_relogin_is_disabled_after_three_failures(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                    auto_login_enabled=True,
+                )
+                meta_path = mcp_server._session_paths("work")["meta"]
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+                metadata["autoLoginFailureCount"] = 2
+                meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+                mcp_server._block_auto_login("work", now=1000)
+                final = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(final["autoLoginFailureCount"], 3)
+        self.assertFalse(final["autoLoginEnabled"])
+        self.assertTrue(final["autoLoginRequiresManualAuth"])
+
+    def test_apparently_successful_relogin_that_stays_unauthorized_is_cooled_down(self):
+        calls = {"login": 0}
+
+        class StillUnauthorizedClient(ExpiredAuthClient):
+            def login(self, username, password):
+                calls["login"] += 1
+                Path(self.cookie_file).write_text("new-cookie", encoding="utf-8")
+                return True
+
+            def assert_logged_in(self):
+                raise RuntimeError("当前 cookie 未登录或已失效，请先 login")
+
+        class FakeCredentialStore:
+            def load(self, base_url, session, username):
+                return "stored-secret"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                    auto_login_enabled=True,
+                )
+                with patch.object(mcp_server, "OAClient", StillUnauthorizedClient):
+                    with patch("oa_agent_connector.mcp_server.SystemCredentialStore", return_value=FakeCredentialStore()):
+                        for message_id in (1, 2):
+                            mcp_server.handle(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": message_id,
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": "oa_list_todos",
+                                        "arguments": {"session": "work"},
+                                    },
+                                }
+                            )
+
+                metadata = json.loads(mcp_server._session_paths("work")["meta"].read_text(encoding="utf-8"))
+
+        self.assertEqual(calls["login"], 1)
+        self.assertNotIn("autoLoginLastSucceededAt", metadata)
+
+    def test_concurrent_automatic_relogin_uses_one_password_attempt(self):
+        calls = {"login": 0}
+        calls_lock = threading.Lock()
+        start_barrier = threading.Barrier(2)
+
+        class ConcurrentReloginClient(FakeClient):
+            def login(self, username, password):
+                with calls_lock:
+                    calls["login"] += 1
+                time.sleep(0.2)
+                Path(self.cookie_file).write_text("refreshed-cookie", encoding="utf-8")
+                return True
+
+            def assert_logged_in(self):
+                cookie_path = Path(self.cookie_file)
+                if not cookie_path.exists() or cookie_path.read_text(encoding="utf-8") != "refreshed-cookie":
+                    raise RuntimeError("当前 cookie 未登录或已失效，请先 login")
+
+        class FakeCredentialStore:
+            def load(self, base_url, session, username):
+                return "stored-secret"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                    auto_login_enabled=True,
+                )
+                results = []
+
+                def relogin():
+                    start_barrier.wait(timeout=5)
+                    results.append(mcp_server._try_auto_login("work"))
+
+                with patch.object(mcp_server, "OAClient", ConcurrentReloginClient):
+                    with patch("oa_agent_connector.mcp_server.SystemCredentialStore", return_value=FakeCredentialStore()):
+                        threads = [threading.Thread(target=relogin) for _ in range(2)]
+                        for thread in threads:
+                            thread.start()
+                        for thread in threads:
+                            thread.join(timeout=5)
+                            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(results, [True, True])
+        self.assertEqual(calls["login"], 1)
+
     def test_initialize_and_tools_list(self):
         init = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "oa-agent-connector")
@@ -57,9 +493,51 @@ class MCPServerTest(unittest.TestCase):
         self.assertIn("oa_setup_guide", names)
         self.assertIn("oa_begin_auth", names)
         self.assertIn("oa_local_auth_status", names)
+        self.assertIn("oa_disable_auto_login", names)
         self.assertNotIn("oa_login", names)
         self.assertIn("oa_list_todos", names)
         self.assertNotIn("password", json.dumps(tools["result"]["tools"], ensure_ascii=False).lower())
+
+    def test_disable_auto_login_deletes_system_credential_but_keeps_cookie(self):
+        calls = []
+
+        class FakeCredentialStore:
+            def delete(self, base_url, session, username):
+                calls.append((base_url, session, username))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                    auto_login_enabled=True,
+                )
+                cookie_path = mcp_server._session_paths("work")["cookie"]
+                cookie_path.write_text("active-cookie", encoding="utf-8")
+                with patch("oa_agent_connector.mcp_server.SystemCredentialStore", return_value=FakeCredentialStore()):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_disable_auto_login",
+                                "arguments": {"session": "work"},
+                            },
+                        }
+                    )
+                metadata = json.loads(mcp_server._session_paths("work")["meta"].read_text(encoding="utf-8"))
+                cookie_text = cookie_path.read_text(encoding="utf-8")
+
+        self.assertFalse(response["result"].get("isError", False))
+        self.assertEqual(calls, [("https://example.invalid/oa/", "work", "u001")])
+        self.assertFalse(metadata["autoLoginEnabled"])
+        self.assertEqual(cookie_text, "active-cookie")
 
     def test_login_then_list_todos(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -382,9 +860,9 @@ class MCPServerTest(unittest.TestCase):
             def auth_status(self):
                 return {
                     "ok": True,
-                    "loginAs": "姚斐/技术经理",
+                    "loginAs": "示例用户/技术经理",
                     "identityAvailable": True,
-                    "identity": {"userName": "姚斐", "position": "技术经理"},
+                    "identity": {"userName": "示例用户", "position": "技术经理"},
                 }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -400,7 +878,7 @@ class MCPServerTest(unittest.TestCase):
                     )
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["loginAs"], "姚斐/技术经理")
+        self.assertEqual(payload["loginAs"], "示例用户/技术经理")
         self.assertEqual(payload["session"], "work")
 
     def test_auth_status_falls_back_to_saved_login_account(self):
@@ -517,6 +995,65 @@ class MCPServerTest(unittest.TestCase):
 
 
 class SearchMCPServerTest(unittest.TestCase):
+    def test_batch_search_relogs_in_before_starting_the_batch(self):
+        calls = {"login": 0, "batch": 0}
+
+        class BatchReloginClient(FakeClient):
+            def assert_logged_in(self):
+                cookie_path = Path(self.cookie_file)
+                if not cookie_path.exists() or cookie_path.read_text(encoding="utf-8") != "refreshed-cookie":
+                    raise RuntimeError("当前 cookie 未登录或已失效，请先 login")
+
+            def login(self, username, password):
+                calls["login"] += 1
+                Path(self.cookie_file).write_text("refreshed-cookie", encoding="utf-8")
+                return True
+
+            def batch_search_objects(self, queries, **kwargs):
+                calls["batch"] += 1
+                return {
+                    "items": [],
+                    "summary": {
+                        "totalQueries": len(queries),
+                        "matchedQueries": 0,
+                        "errors": 0,
+                        "downloads": 0,
+                    },
+                }
+
+        class FakeCredentialStore:
+            def load(self, base_url, session, username):
+                return "stored-secret"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                    auto_login_enabled=True,
+                )
+                with patch.object(mcp_server, "OAClient", BatchReloginClient):
+                    with patch("oa_agent_connector.mcp_server.SystemCredentialStore", return_value=FakeCredentialStore()):
+                        response = mcp_server.handle(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "oa_batch_search_objects",
+                                    "arguments": {"queries": ["a", "b"], "session": "work"},
+                                },
+                            }
+                        )
+
+        self.assertFalse(response["result"].get("isError", False))
+        self.assertEqual(calls, {"login": 1, "batch": 1})
+
     def test_search_tools_are_listed_with_strict_schema(self):
         tools = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})["result"]["tools"]
         by_name = {tool["name"]: tool for tool in tools}
@@ -675,6 +1212,34 @@ class SearchMCPServerTest(unittest.TestCase):
 
 
 class SensitiveOutputRegressionTest(unittest.TestCase):
+    def test_encoded_and_json_passwords_are_never_returned(self):
+        class LeakyClient(FakeClient):
+            def search_objects(self, **kwargs):
+                raise RuntimeError(
+                    '{"password":"json-secret","next":"j_password%3Dencoded-secret%26x%3D1"}'
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                with patch.object(mcp_server, "OAClient", LeakyClient):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "oa_search_objects", "arguments": {"query": "abc"}},
+                        }
+                    )
+
+        text = json.dumps(response, ensure_ascii=False)
+        self.assertIn("敏感内容已隐藏", text)
+        self.assertNotIn("json-secret", text)
+        self.assertNotIn("encoded-secret", text)
+
     def test_new_tool_error_output_does_not_leak_sensitive_patterns(self):
         class LeakyClient(FakeClient):
             def search_objects(self, **kwargs):

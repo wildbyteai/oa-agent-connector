@@ -21,11 +21,13 @@ class TimeoutApprovalClient(FakeOAClient):
     def __init__(self):
         super().__init__(json.dumps({"rows": [{"fdId": "1234567890abcdef1234567890abcdef"}]}))
         self.used_ui_fallback = False
+        self.rest_attempted = False
 
     def _request(self, path, method="GET", params=None, data=None):
         if params and params.get("method") == "list":
             return {"url": "https://example.invalid/oa/list", "text": self.todo_text}
         if path == "api/km-review/kmReviewRestService/approveProcess":
+            self.rest_attempted = True
             raise TimeoutError("timed out")
         return {"url": "https://example.invalid/oa/ok", "text": "ok"}
 
@@ -71,7 +73,7 @@ class OAClientTest(unittest.TestCase):
     def test_auth_status_extracts_login_identity_from_json(self):
         payload = {
             "currentUser": {
-                "currentUserName": "姚斐",
+                "currentUserName": "示例用户",
                 "deptName": "技术部",
                 "postName": "技术经理",
             }
@@ -79,15 +81,15 @@ class OAClientTest(unittest.TestCase):
         client = FakeOAClient(json.dumps(payload, ensure_ascii=False))
         status = client.auth_status()
         self.assertTrue(status["ok"])
-        self.assertEqual(status["loginAs"], "姚斐/技术经理")
+        self.assertEqual(status["loginAs"], "示例用户/技术经理")
         self.assertTrue(status["identityAvailable"])
         self.assertEqual(status["identity"]["department"], "技术部")
 
     def test_auth_status_extracts_login_identity_from_html(self):
-        client = FakeOAClient("<html><body>当前用户：姚斐</body></html>")
+        client = FakeOAClient("<html><body>当前用户：示例用户</body></html>")
         status = client.auth_status()
         self.assertTrue(status["ok"])
-        self.assertEqual(status["loginAs"], "姚斐")
+        self.assertEqual(status["loginAs"], "示例用户")
 
     def test_auth_status_does_not_treat_business_row_as_login_identity(self):
         payload = {
@@ -119,13 +121,13 @@ class OAClientTest(unittest.TestCase):
             ],
             "currentUser": {
                 "loginName": "u001",
-                "fdUserName": "姚斐",
+                "fdUserName": "示例用户",
                 "postName": "技术经理",
             },
         }
         client = FakeOAClient(json.dumps(payload, ensure_ascii=False))
         status = client.auth_status()
-        self.assertEqual(status["loginAs"], "姚斐/技术经理")
+        self.assertEqual(status["loginAs"], "示例用户/技术经理")
 
     def test_approval_dry_run_requires_current_todo(self):
         client = FakeOAClient(json.dumps({"rows": [{"fdId": "1234567890abcdef1234567890abcdef"}]}))
@@ -137,16 +139,18 @@ class OAClientTest(unittest.TestCase):
         with self.assertRaises(PermissionGateError):
             client.approve("ffffffffffffffffffffffffffffffff", "同意")
 
-    def test_approval_timeout_falls_back_to_ui_form(self):
+    def test_approval_execute_uses_single_ui_form_path(self):
         client = TimeoutApprovalClient()
         result = client.approve("1234567890abcdef1234567890abcdef", "同意", execute=True)
         self.assertTrue(client.used_ui_fallback)
+        self.assertFalse(client.rest_attempted)
         self.assertEqual(result["transport"], "ui-form")
 
-    def test_wrapped_approval_timeout_falls_back_to_ui_form(self):
+    def test_approval_execute_does_not_probe_rest_even_if_it_would_timeout(self):
         client = WrappedTimeoutApprovalClient()
         result = client.approve("1234567890abcdef1234567890abcdef", "同意", execute=True)
         self.assertTrue(client.used_ui_fallback)
+        self.assertFalse(client.rest_attempted)
         self.assertEqual(result["transport"], "ui-form")
 
     def test_find_review_workitem_handles_malformed_xml_attrs(self):
