@@ -88,6 +88,10 @@ ALLOWED_DOC_FILE_TYPES = ("", "pdf", "doc;docx", "xls;xlsx", "ppt;pptx", "txt")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 ATTACHMENT_TITLE_RE = re.compile(r"\.(?:pdf|docx?|xlsx?|pptx?|txt|jpe?g|png|gif|bmp|zip|rar|7z)(?:$|[\s)）\]}】])", re.I)
+APPROVAL_ACTION_TO_OPERATION = {
+    "approve": "handler_pass",
+    "reject": "handler_refuse",
+}
 
 
 def _review_detail_path(fd_id: str) -> str:
@@ -96,6 +100,14 @@ def _review_detail_path(fd_id: str) -> str:
 
 
 class OAConnectorError(RuntimeError):
+    pass
+
+
+class ApprovalResultUnknownError(OAConnectorError):
+    pass
+
+
+class ApprovalStateChangedError(OAConnectorError):
     pass
 
 
@@ -132,27 +144,75 @@ class _FormParser(HTMLParser):
         self.fields: List[tuple[str, str]] = []
         self._textarea_name: Optional[str] = None
         self._textarea_parts: List[str] = []
+        self._select_name: Optional[str] = None
+        self._select_multiple = False
+        self._select_options: List[tuple[str, bool]] = []
+        self._in_option = False
+        self._option_value: Optional[str] = None
+        self._option_selected = False
+        self._option_parts: List[str] = []
 
     def handle_starttag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
         data = {key: value or "" for key, value in attrs}
         if tag == "input" and "name" in data:
+            if "disabled" in data:
+                return
             input_type = data.get("type", "text").lower()
+            if input_type in ("button", "submit", "reset", "image", "file"):
+                return
             if input_type in ("checkbox", "radio") and "checked" not in data:
                 return
             self.fields.append((data["name"], data.get("value", "")))
         elif tag == "textarea" and "name" in data:
+            if "disabled" in data:
+                return
             self._textarea_name = data["name"]
             self._textarea_parts = []
+        elif tag == "select" and "name" in data:
+            if "disabled" in data:
+                return
+            self._select_name = data["name"]
+            self._select_multiple = "multiple" in data
+            self._select_options = []
+        elif tag == "option" and self._select_name is not None:
+            if "disabled" in data:
+                self._in_option = False
+                return
+            self._in_option = True
+            self._option_value = data["value"] if "value" in data else None
+            self._option_selected = "selected" in data
+            self._option_parts = []
 
     def handle_data(self, data: str) -> None:
         if self._textarea_name:
             self._textarea_parts.append(data)
+        if self._in_option:
+            self._option_parts.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "textarea" and self._textarea_name:
             self.fields.append((self._textarea_name, "".join(self._textarea_parts)))
             self._textarea_name = None
             self._textarea_parts = []
+        elif tag == "option" and self._select_name is not None and self._in_option:
+            value = self._option_value if self._option_value is not None else "".join(self._option_parts).strip()
+            self._select_options.append((value, self._option_selected))
+            self._in_option = False
+            self._option_value = None
+            self._option_selected = False
+            self._option_parts = []
+        elif tag == "select" and self._select_name:
+            selected = [value for value, is_selected in self._select_options if is_selected]
+            if not selected and self._select_options:
+                selected = [self._select_options[0][0]]
+            if not self._select_multiple:
+                selected = selected[:1]
+            for value in selected:
+                self.fields.append((self._select_name, value))
+            self._select_name = None
+            self._select_multiple = False
+            self._select_options = []
+            self._in_option = False
 
 
 class OAClient:
@@ -350,6 +410,10 @@ class OAClient:
         }
 
     def list_todos(self, page: int = 1, page_size: int = 20) -> List[OATodo]:
+        response = self._request_todo_list(page=page, page_size=page_size)
+        return self._parse_todos(response["text"])
+
+    def _request_todo_list(self, page: int, page_size: int) -> Dict[str, str]:
         response = self._request(
             "km/review/km_review_index/kmReviewIndex.do",
             params={
@@ -364,7 +428,7 @@ class OAClient:
         )
         if self._looks_like_login_page(response["url"], response["text"]):
             raise OAConnectorError("当前会话未登录，不能查询待办")
-        return self._parse_todos(response["text"])
+        return response
 
     def search_objects(self, **kwargs: Any) -> Dict[str, Any]:
         validated = self._validate_search_params(kwargs)
@@ -787,6 +851,7 @@ class OAClient:
         audit_note: str,
         execute: bool = False,
         future_node_id: Optional[str] = None,
+        expected_binding: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         return self._approval_action(
             fd_id=fd_id,
@@ -794,14 +859,22 @@ class OAClient:
             audit_note=audit_note,
             execute=execute,
             future_node_id=future_node_id,
+            expected_binding=expected_binding,
         )
 
-    def reject(self, fd_id: str, audit_note: str, execute: bool = False) -> Dict[str, Any]:
+    def reject(
+        self,
+        fd_id: str,
+        audit_note: str,
+        execute: bool = False,
+        expected_binding: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         return self._approval_action(
             fd_id=fd_id,
             operation_type="handler_refuse",
             audit_note=audit_note,
             execute=execute,
+            expected_binding=expected_binding,
         )
 
     def _approval_action(
@@ -811,27 +884,62 @@ class OAClient:
         audit_note: str,
         execute: bool,
         future_node_id: Optional[str] = None,
+        expected_binding: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         self._assert_fd_id_in_current_todos(fd_id)
-        flow_param: Dict[str, Any] = {
-            "operationType": operation_type,
-            "auditNote": audit_note,
-            "operParam": {},
-        }
-        if future_node_id:
-            flow_param["futureNodeId"] = future_node_id
-
-        payload = {"fdId": fd_id, "flowParam": json.dumps(flow_param, ensure_ascii=False)}
-        endpoint = "api/km-review/kmReviewRestService/approveProcess"
+        action = next(
+            (name for name, value in APPROVAL_ACTION_TO_OPERATION.items() if value == operation_type),
+            None,
+        )
+        if action is None:
+            raise OAConnectorError("不支持的审批动作")
         if not execute:
+            capability = self.validate_approval_action(fd_id, action, require_in_todo=False)
+            payload: Dict[str, Any] = {
+                "fdId": fd_id,
+                "action": action,
+                "note": audit_note,
+            }
+            if future_node_id:
+                payload["futureNodeId"] = future_node_id
             return {
                 "dryRun": True,
                 "method": "POST",
-                "endpoint": urllib.parse.urljoin(self.base_url, endpoint),
+                "formSource": "view",
+                "submitMethod": "publishDraft",
                 "payload": payload,
+                "operationAvailable": capability["operationAvailable"],
                 "permissionGate": "fdId was present in current session's type=unExecuted list",
             }
-        return self._approval_action_via_ui(fd_id, operation_type, audit_note, future_node_id)
+        return self._approval_action_via_ui(
+            fd_id,
+            operation_type,
+            audit_note,
+            future_node_id,
+            expected_binding=expected_binding,
+        )
+
+    def validate_approval_action(
+        self,
+        fd_id: str,
+        action: str,
+        require_in_todo: bool = True,
+    ) -> Dict[str, Any]:
+        operation_type = APPROVAL_ACTION_TO_OPERATION.get(action)
+        if operation_type is None:
+            raise OAConnectorError("审批动作只允许 approve 或 reject")
+        if require_in_todo:
+            self._assert_fd_id_in_current_todos(fd_id)
+        approval_page, form_data, task = self._load_approval_form(fd_id, operation_type)
+        return {
+            "fdId": fd_id,
+            "action": action,
+            "operationAvailable": True,
+            "title": self._extract_title(approval_page["text"]),
+            "url": approval_page["url"],
+            "formSource": "view",
+            "approvalBinding": self._approval_binding(fd_id, operation_type, form_data, task),
+        }
 
     def _approval_action_via_ui(
         self,
@@ -839,18 +947,27 @@ class OAClient:
         operation_type: str,
         audit_note: str,
         future_node_id: Optional[str] = None,
+        expected_binding: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        edit = self._request(
-            "km/review/km_review_main/kmReviewMain.do",
-            params={"method": "edit", "fdId": fd_id},
-        )
-        if self._looks_like_login_page(edit["url"], edit["text"]):
-            raise OAConnectorError("当前会话未登录，不能处理审批")
-
-        form_data = self._parse_form_fields(edit["text"])
+        _, form_data, task = self._load_approval_form(fd_id, operation_type)
+        current_binding = self._approval_binding(fd_id, operation_type, form_data, task)
+        if expected_binding is not None and current_binding != expected_binding:
+            raise ApprovalStateChangedError("审批流程状态已变化，请重新准备审批并再次确认")
         process_id = form_data.get("sysWfBusinessForm.fdProcessId") or fd_id
         audit_note_id = form_data.get("sysWfBusinessForm.fdAuditNoteFdId") or ""
-        task = self._find_review_workitem(form_data.get("sysWfBusinessForm.fdCurNodeXML", ""), operation_type)
+        jump_node_id: Optional[str] = None
+
+        if operation_type == "handler_refuse":
+            node_id = self._current_node_id(form_data.get("sysWfBusinessForm.fdTranProcessXML", ""))
+            jump_node_id = self._default_refuse_node(process_id, node_id)
+            if expected_binding is not None:
+                _, form_data, task = self._load_approval_form(fd_id, operation_type)
+                current_binding = self._approval_binding(fd_id, operation_type, form_data, task)
+                if current_binding != expected_binding:
+                    raise ApprovalStateChangedError("审批流程状态已变化，请重新准备审批并再次确认")
+                process_id = form_data.get("sysWfBusinessForm.fdProcessId") or fd_id
+                audit_note_id = form_data.get("sysWfBusinessForm.fdAuditNoteFdId") or ""
+
         param: Dict[str, Any] = {
             "operationName": "驳回" if operation_type == "handler_refuse" else "通过",
             "notifyType": "{}",
@@ -862,11 +979,9 @@ class OAClient:
         }
 
         if operation_type == "handler_refuse":
-            node_id = self._current_node_id(form_data.get("sysWfBusinessForm.fdTranProcessXML", ""))
-            jump_node_id = self._default_refuse_node(process_id, node_id)
             param.update(
                 {
-                    "jumpToNodeId": jump_node_id,
+                    "jumpToNodeId": jump_node_id or "",
                     "jumpToNodeInstanceId": "",
                     "refusePassedToThisNode": False,
                     "refusePassedToThisNodeOnNode": False,
@@ -889,15 +1004,18 @@ class OAClient:
         form_data["sysWfBusinessForm.fdSystemNotifyType"] = "{}"
         form_data["fdUsageContent"] = audit_note
 
-        response = self._request(
-            "km/review/km_review_main/kmReviewMain.do",
-            method="POST",
-            params={"method": "update"},
-            data=form_data,
-        )
-        plain = self._strip_html(response["text"])
-        if '"status":true' not in response["text"] and "您的操作已成功" not in plain:
-            raise OAConnectorError(f"审批表单提交失败: {plain[:800]}")
+        try:
+            response = self._request(
+                "km/review/km_review_main/kmReviewMain.do",
+                method="POST",
+                params={"method": "publishDraft"},
+                data=form_data,
+            )
+        except (OAConnectorError, TimeoutError) as exc:
+            return self._verify_ambiguous_approval_submit(fd_id, operation_type, cause=exc)
+
+        if not self._approval_submit_succeeded(response["text"]):
+            return self._verify_ambiguous_approval_submit(fd_id, operation_type)
 
         self._save_cookies()
         return {
@@ -905,6 +1023,91 @@ class OAClient:
             "fdId": fd_id,
             "result": "success",
             "transport": "ui-form",
+            "formSource": "view",
+            "submitMethod": "publishDraft",
+            "operationType": operation_type,
+        }
+
+    def _approval_submit_succeeded(self, response_text: str) -> bool:
+        parsed = self._try_json(response_text.lstrip("\ufeff\r\n\t "))
+        if isinstance(parsed, dict) and parsed.get("status") is True:
+            return True
+        return "您的操作已成功" in self._strip_html(response_text)
+
+    def _verify_ambiguous_approval_submit(
+        self,
+        fd_id: str,
+        operation_type: str,
+        cause: Optional[BaseException] = None,
+    ) -> Dict[str, Any]:
+        try:
+            response = self._request_todo_list(page=1, page_size=200)
+            parsed = self._try_json(response["text"].lstrip("\ufeff\r\n\t "))
+            if (
+                parsed is None
+                or not self._has_todo_collection_shape(parsed)
+                or self._todo_payload_reports_error(parsed)
+            ):
+                raise OAConnectorError("OA 待办核验返回格式无法确认")
+            todos = self._parse_todos(response["text"])
+            total_size = self._todo_total_size(parsed)
+            if total_size is None or total_size > len(todos):
+                raise OAConnectorError("OA 待办核验返回的分页范围不完整")
+        except Exception as exc:
+            self._save_cookies()
+            raise ApprovalResultUnknownError(
+                "审批请求已经发出，但 OA 没有返回明确结果，当前也无法核验待办状态。"
+                "请勿重复提交，请先在 OA 页面查看这条单据的流程状态。"
+            ) from (cause or exc)
+
+        self._save_cookies()
+        if any(todo.fd_id == fd_id for todo in todos):
+            raise ApprovalResultUnknownError(
+                "审批请求已经发出，但 OA 没有返回明确结果；这条单据目前仍显示在待办中。"
+                "请勿重复提交，请先在 OA 页面核对流程状态。"
+            ) from cause
+        raise ApprovalResultUnknownError(
+            "审批请求已经发出，且这条单据已经不在当前待办中，但这仍不能证明本次审批动作已成功。"
+            "请勿重复提交，请先在 OA 页面查看流程记录。"
+        ) from cause
+
+    def _load_approval_form(
+        self,
+        fd_id: str,
+        operation_type: str,
+    ) -> tuple[Dict[str, Any], Dict[str, str], Dict[str, str]]:
+        approval_page = self._request(
+            "km/review/km_review_main/kmReviewMain.do",
+            params={"method": "view", "fdId": fd_id},
+        )
+        if self._looks_like_login_page(approval_page["url"], approval_page["text"]):
+            raise OAConnectorError("当前会话未登录，不能处理审批")
+
+        form_data = self._parse_form_fields(approval_page["text"])
+        form_fd_id = form_data.get("fdId", "").strip()
+        if form_fd_id and form_fd_id != fd_id:
+            raise OAConnectorError("审批页面返回的单据与当前待办不一致")
+        form_data["fdId"] = fd_id
+        default_task_id = self._page_default_task_id(approval_page["text"])
+        task = self._find_review_workitem(
+            form_data.get("sysWfBusinessForm.fdCurNodeXML", ""),
+            operation_type,
+            default_task_id=default_task_id,
+        )
+        return approval_page, form_data, task
+
+    def _approval_binding(
+        self,
+        fd_id: str,
+        operation_type: str,
+        form_data: Dict[str, str],
+        task: Dict[str, str],
+    ) -> Dict[str, str]:
+        return {
+            "processId": str(form_data.get("sysWfBusinessForm.fdProcessId") or fd_id),
+            "taskId": str(task.get("id") or ""),
+            "nodeId": str(task.get("nodeId") or ""),
+            "activityType": str(task.get("type") or ""),
             "operationType": operation_type,
         }
 
@@ -916,8 +1119,17 @@ class OAClient:
             data.setdefault(key, unescape(value))
         return data
 
-    def _find_review_workitem(self, current_node_xml: str, required_operation: Optional[str] = None) -> Dict[str, str]:
-        regex_task = self._find_review_workitem_by_regex(current_node_xml, required_operation)
+    def _find_review_workitem(
+        self,
+        current_node_xml: str,
+        required_operation: Optional[str] = None,
+        default_task_id: Optional[str] = None,
+    ) -> Dict[str, str]:
+        regex_task = self._find_review_workitem_by_regex(
+            current_node_xml,
+            required_operation,
+            default_task_id=default_task_id,
+        )
         if regex_task:
             return regex_task
 
@@ -925,31 +1137,48 @@ class OAClient:
             root = ET.fromstring(current_node_xml)
         except ET.ParseError as exc:
             raise OAConnectorError("未找到当前登录账号可处理的流程 workitem") from exc
+        candidates = []
         for task in root.findall(".//task"):
-            task_type = task.attrib.get("type", "")
-            operations = {op.attrib.get("id") for op in task.findall(".//operation")}
-            if self._is_review_workitem(task_type, operations, required_operation):
-                return {"id": task.attrib["id"], "type": task_type}
+            operations = [dict(op.attrib) for op in task.findall(".//operation")]
+            if self._is_review_workitem(dict(task.attrib), operations, required_operation):
+                candidates.append(
+                    {
+                        "id": task.attrib["id"],
+                        "type": task.attrib.get("type", ""),
+                        "nodeId": task.attrib.get("nodeId", ""),
+                    }
+                )
+        if candidates:
+            return self._select_review_workitem(candidates, default_task_id)
         raise OAConnectorError("未找到当前登录账号可处理的流程 workitem")
 
     def _find_review_workitem_by_regex(
-        self, current_node_xml: str, required_operation: Optional[str] = None
+        self,
+        current_node_xml: str,
+        required_operation: Optional[str] = None,
+        default_task_id: Optional[str] = None,
     ) -> Optional[Dict[str, str]]:
         task_pattern = re.compile(r"<task\b(?P<attrs>[^>]*)>(?P<body>.*?)</task>", re.I | re.S)
         operation_pattern = re.compile(r"<operation\b(?P<attrs>[^>]*)/?>", re.I | re.S)
+        candidates = []
         for task_match in task_pattern.finditer(current_node_xml):
             task_attrs = self._attrs_from_text(task_match.group("attrs"))
-            task_type = task_attrs.get("type", "")
             task_id = task_attrs.get("id", "")
             if not task_id:
                 continue
-            operations = {
-                self._attrs_from_text(operation_match.group("attrs")).get("id")
+            operations = [
+                self._attrs_from_text(operation_match.group("attrs"))
                 for operation_match in operation_pattern.finditer(task_match.group("body"))
-            }
-            if self._is_review_workitem(task_type, operations, required_operation):
-                return {"id": task_id, "type": task_type}
-        return None
+            ]
+            if self._is_review_workitem(task_attrs, operations, required_operation):
+                candidates.append(
+                    {
+                        "id": task_id,
+                        "type": task_attrs.get("type", ""),
+                        "nodeId": task_attrs.get("nodeId", ""),
+                    }
+                )
+        return self._select_review_workitem(candidates, default_task_id) if candidates else None
 
     def _attrs_from_text(self, text: str) -> Dict[str, str]:
         attrs: Dict[str, str] = {}
@@ -958,14 +1187,42 @@ class OAClient:
         return attrs
 
     def _is_review_workitem(
-        self, task_type: str, operations: set[Optional[str]], required_operation: Optional[str] = None
+        self,
+        task_attrs: Dict[str, str],
+        operations: List[Dict[str, str]],
+        required_operation: Optional[str] = None,
     ) -> bool:
-        if task_type != "reviewWorkitem":
+        if (
+            task_attrs.get("taskFrom") != "workitem"
+            or not task_attrs.get("type")
+            or not task_attrs.get("id")
+            or not task_attrs.get("nodeId")
+        ):
             return False
-        available_operations = {operation for operation in operations if operation}
+        available_operations = {
+            operation.get("id")
+            for operation in operations
+            if operation.get("operationHandlerType") == "handler" and operation.get("id")
+        }
         if required_operation:
             return required_operation in available_operations
         return bool({"handler_pass", "handler_refuse"} & available_operations)
+
+    def _select_review_workitem(
+        self,
+        candidates: List[Dict[str, str]],
+        default_task_id: Optional[str],
+    ) -> Dict[str, str]:
+        if default_task_id:
+            for candidate in candidates:
+                if candidate["id"] == default_task_id:
+                    return candidate
+        # Matches the native OA page: absent or unmatched defaultTaskId selects the first processor task.
+        return candidates[0]
+
+    def _page_default_task_id(self, html_text: str) -> str:
+        match = re.search(r"\blbpm\.defaultTaskId\s*=\s*(['\"])(.*?)\1", html_text, re.I | re.S)
+        return unescape(match.group(2)).strip() if match else ""
 
     def _current_node_id(self, tran_process_xml: str) -> str:
         root = ET.fromstring(tran_process_xml)
@@ -987,10 +1244,33 @@ class OAClient:
         try:
             nodes = json.loads(response["text"].strip())
         except json.JSONDecodeError as exc:
-            raise OAConnectorError(f"读取可驳回节点失败: {response['text'][:500]}") from exc
+            raise OAConnectorError("读取可驳回节点失败") from exc
         if not nodes:
             raise OAConnectorError("当前节点没有可驳回节点")
-        return str(nodes[0]).split("#", 1)[0]
+        # Matches syslbpmprocess_simple_tag.js: previous-node default selects the last option.
+        selected = nodes[-1] if len(nodes) > 1 and self._refuse_to_previous_node_default() else nodes[0]
+        return str(selected).split("#", 1)[0]
+
+    def _refuse_to_previous_node_default(self) -> bool:
+        response = self._request(
+            "sys/common/dataxml.jsp",
+            params={"s_bean": "lbpmSettingInfoService"},
+        )
+        if self._looks_like_login_page(response["url"], response["text"]):
+            raise OAConnectorError("当前会话未登录，不能读取驳回规则")
+        try:
+            root = ET.fromstring(response["text"].lstrip("\ufeff\r\n\t "))
+        except ET.ParseError as exc:
+            raise OAConnectorError("读取 OA 驳回默认设置失败") from exc
+        for element in root.iter():
+            value = element.attrib.get("isRefuseToPrevNodeDefault")
+            if value is None:
+                continue
+            normalized = value.strip().lower()
+            if normalized in ("true", "false"):
+                return normalized == "true"
+            raise OAConnectorError("OA 返回了无法识别的驳回默认设置")
+        return False
 
     def _assert_fd_id_in_current_todos(self, fd_id: str) -> None:
         todo_ids = {todo.fd_id for todo in self.list_todos(page=1, page_size=200)}
@@ -1079,6 +1359,42 @@ class OAClient:
                 fd_ids.append(fd_id)
         subjects = [self._strip_html(match.group(1)).strip() for match in SUBJECT_RE.finditer(text)]
         return [OATodo(fd_id=fd_id, subject=subjects[i] if i < len(subjects) else "") for i, fd_id in enumerate(fd_ids)]
+
+    def _has_todo_collection_shape(self, node: Any) -> bool:
+        if isinstance(node, list):
+            return True
+        if not isinstance(node, dict):
+            return False
+        for key in ("datas", "rows", "list", "data", "items"):
+            if key in node and isinstance(node[key], list):
+                return True
+        return any(self._has_todo_collection_shape(value) for value in node.values() if isinstance(value, dict))
+
+    def _todo_payload_reports_error(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("success") is False or payload.get("status") is False:
+            return True
+        return any(payload.get(key) for key in ("error", "errorMessage", "exception", "EsError"))
+
+    def _todo_total_size(self, payload: Any) -> Optional[int]:
+        if not isinstance(payload, dict):
+            return None
+        containers = [payload]
+        for key in ("page", "queryPage"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+        for container in containers:
+            for key in ("totalSize", "totalCount", "total"):
+                if key not in container:
+                    continue
+                try:
+                    value = int(str(container[key]).strip())
+                except (TypeError, ValueError):
+                    return None
+                return value if value >= 0 else None
+        return None
 
     def _try_json(self, text: str) -> Optional[Any]:
         try:

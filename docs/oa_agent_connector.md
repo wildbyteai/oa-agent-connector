@@ -4,7 +4,7 @@
 
 - 登录：`POST /j_acegi_security_check`
 - 待我审列表：`GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval&mydoc=approval`
-- 审批处理：先读取现有编辑表单，再通过 `POST /km/review/km_review_main/kmReviewMain.do?method=update` 提交
+- 审批处理：读取现有详情页中的原生审批表单，再通过 `POST /km/review/km_review_main/kmReviewMain.do?method=publishDraft` 提交
 - 详情查看：`GET /km/review/km_review_main/kmReviewMain.do?method=view&fdId=...`
 - 通用搜索：`GET /sys/ftsearch/searchBuilder.do?method=search&resultType=json`
 - 文档详情：基于搜索结果返回的受控 `recordRef.path`
@@ -17,10 +17,14 @@
 1. 必须先登录，连接器使用登录后 cookie。
 2. 每次审批前重新查询当前登录账号的 `type=unExecuted` 待审列表。
 3. 只有 `fdId` 在当前待审列表中才允许提交审批接口。
-4. 连接器不接受也不传入任意 `handler`，避免绕过当前登录账号权限。
-5. `approve` / `reject` 默认 dry-run，只有显式 `--execute` 才会真正提交。
+4. 从 `method=view` 详情页读取当前 workitem，只接受 OA 原生标记为 `taskFrom=workitem` 且操作身份为 `handler` 的任务，并确认用户要求的同意或驳回动作确实可用。
+5. 不使用 `method=edit` 判断审批权限；流程节点可以允许审批但禁止修改申请正文。
+6. 连接器不接受也不传入任意 `handler`，避免绕过当前登录账号权限。
+7. `approve` / `reject` 默认 dry-run，只有显式 `--execute` 才会真正提交。
 
-MCP 正式审批还增加两层保护：确认令牌会被单个进程原子占用，并绑定准备审批时的 OA 登录账号。审批只使用页面表单这一条提交路径，不会在请求超时后自动改用另一条路径再次提交。
+有多个当前 workitem 时，连接器遵循页面中的 `lbpm.defaultTaskId`，没有指定时与 OA 页面一致取第一个。驳回节点读取 OA 的 `isRefuseToPrevNodeDefault` 设置：开启时取可驳回列表最后一项，否则取第一项。
+
+MCP 正式审批还增加两层保护：准备确认摘要时就验证所选动作存在于当前 workitem；确认令牌会在网络请求前被单个进程原子占用，并绑定准备审批时的 OA 登录账号以及 `processId/taskId/nodeId/activityType/operationType`。自动登录恢复后会再次核对账号绑定；确认时任一流程绑定值变化都要求重新准备。即使状态文件删除失败，占用标记也会保留，避免旧 token 再次可用。审批只使用页面表单这一条提交路径，不会在请求超时后自动改用另一条路径再次提交。如果提交响应不明确，只查询一次当前待办获取线索；无论单据仍在还是已经离开待办，都返回“结果不明确，请勿重复提交”，不能仅凭待办消失宣称成功。
 
 ## 用法
 

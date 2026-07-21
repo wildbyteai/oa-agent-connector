@@ -240,8 +240,12 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 - `oa_search_objects`、`oa_get_object_detail`、`oa_download_attachment` 只做当前账号权限内的只读搜索、详情查看和附件下载。
 - `oa_download_attachment` 只允许下载详情页里枚举出来的附件，不暴露任意 URL 下载能力。
 - MCP 正式审批必须走 `oa_prepare_approval` -> 用户确认 -> `oa_confirm_approval`。
-- `oa_prepare_approval` 会先确认 `fdId` 在当前登录账号待办清单中，并整理单据、动作、备注、当前节点、当前处理人。
+- `oa_prepare_approval` 会先确认 `fdId` 在当前登录账号待办清单中，并从详情页确认用户选择的同意或驳回动作确实可用，再整理单据、动作、备注、当前节点、当前处理人。
 - `oa_confirm_approval` 执行前会再次查询当前登录账号待办清单，`fdId` 不在清单中则拒绝。
+- 审批执行从 OA 原生详情页读取当前处理人和可用动作，不依赖申请正文的编辑权限。即使节点禁止修改正文，只要 OA 详情页确认当前账号可审批，连接器仍可按原生流程处理。
+- 当前审批任务和默认驳回节点都遵循 OA 页面自身规则，不允许 Agent 自行指定审批人或猜测驳回节点。
+- 准备审批时会绑定当前登录账号、流程、任务、节点和动作；自动登录恢复后会再次核对账号，确认时任一项变化都会拒绝执行，并要求重新准备。
+- 审批请求只发送一次。OA 没有返回明确结果时，连接器只刷新一次待办获取核对线索；即使单据已离开待办也不能据此宣称成功，必须提示用户去 OA 页面查看，不能自动重试。
 - `oa_approve` / `oa_reject` 仅保留 dry-run 兼容；MCP 禁止通过它们直接 `execute=true`。
 - MCP 不暴露原始 URL 请求、原始 `flowParam` 或任意 `handler` 参数。
 
@@ -300,7 +304,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 确认驳回
 ```
 
-确认 token 默认 15 分钟有效，过期后需要重新准备审批。执行时会重新校验当前账号是否仍有这条待办的审批权限。
+确认 token 默认 15 分钟有效，过期后需要重新准备审批。执行时会重新校验当前账号是否仍有这条待办的审批权限。提交请求一旦发出，同一个 token 不会再次使用；如果结果不明确，先到 OA 页面核对，不能直接重复确认。
 
 ## 可用工具
 

@@ -12,14 +12,14 @@ from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .client import OAClient, OAConnectorError
+from .client import ApprovalResultUnknownError, ApprovalStateChangedError, OAClient, OAConnectorError
 from .credential_store import CredentialStoreError, SystemCredentialStore
 from .local_auth import begin_local_auth, read_local_auth_status, transport_security_issue
 from .security import sanitize_error_message
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.9"
+SERVER_VERSION = "0.2.10"
 
 
 def _state_dir() -> Path:
@@ -528,20 +528,22 @@ def _claim_pending_approval(token: str) -> Dict[str, Any]:
     except Exception:
         if fd >= 0:
             os.close(fd)
-        if source.exists():
-            try:
-                claimed.unlink()
-            except OSError:
-                pass
         raise
 
 
 def _delete_pending_approval(token: str) -> None:
-    for path in (_pending_path(token), _pending_claim_path(token)):
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    source = _pending_path(token)
+    claimed = _pending_claim_path(token)
+    try:
+        source.unlink()
+    except OSError:
+        pass
+    if source.exists():
+        return
+    try:
+        claimed.unlink()
+    except OSError:
+        pass
 
 
 def _tool_schema(name: str, description: str, properties: Dict[str, Any], required: Optional[list[str]] = None) -> Dict[str, Any]:
@@ -640,7 +642,7 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_prepare_approval",
-        "准备审批动作：校验当前账号待办权限，整理单据、动作和备注，生成待用户确认的摘要和 confirmationToken。不提交审批。",
+        "准备审批动作：校验当前账号待办权限和当前节点可用动作，整理单据、动作和备注，生成待用户确认的摘要和 confirmationToken。不提交审批。",
         {
             "fdId": {"type": "string"},
             "action": {"type": "string", "enum": ["approve", "reject"], "description": "approve=同意，reject=驳回"},
@@ -977,17 +979,63 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 if _auth_required_reason(str(retry_exc)):
                     _block_auto_login(pending_session)
                 raise
-        if pending["action"] == "approve":
-            result = confirm_client.approve(
-                str(pending["fdId"]),
-                str(pending["note"]),
-                execute=True,
-                future_node_id=pending.get("futureNodeId"),
+        current_binding = _approval_login_binding(pending_session, str(pending["baseUrl"]))
+        if not pending.get("loginBinding") or pending["loginBinding"] != current_binding:
+            _delete_pending_approval(token)
+            raise OAConnectorError("OA 登录账号已变化，请重新准备审批并再次确认")
+        approval_binding = pending.get("approvalBinding")
+        if not isinstance(approval_binding, dict) or not all(
+            str(approval_binding.get(key) or "").strip()
+            for key in ("processId", "taskId", "nodeId", "activityType", "operationType")
+        ):
+            _delete_pending_approval(token)
+            raise OAConnectorError("审批确认状态不完整，请重新准备审批并再次确认")
+        try:
+            if pending["action"] == "approve":
+                result = confirm_client.approve(
+                    str(pending["fdId"]),
+                    str(pending["note"]),
+                    execute=True,
+                    future_node_id=pending.get("futureNodeId"),
+                    expected_binding=approval_binding,
+                )
+            else:
+                result = confirm_client.reject(
+                    str(pending["fdId"]),
+                    str(pending["note"]),
+                    execute=True,
+                    expected_binding=approval_binding,
+                )
+        except ApprovalStateChangedError:
+            _delete_pending_approval(token)
+            raise
+        except ApprovalResultUnknownError as exc:
+            _delete_pending_approval(token)
+            return _mcp_error(
+                {
+                    "ok": False,
+                    "resultUnknown": True,
+                    "submittedOnce": True,
+                    "retryAllowed": False,
+                    "action": pending["action"],
+                    "fdId": pending["fdId"],
+                    "reason": str(exc),
+                    "userMessage": str(exc),
+                    "nextStep": "请用户先打开 OA 页面查看这条单据的流程状态，不要再次提交本次审批。",
+                }
             )
-        else:
-            result = confirm_client.reject(str(pending["fdId"]), str(pending["note"]), execute=True)
         _delete_pending_approval(token)
-        return _ok({"ok": True, "executed": True, "action": pending["action"], "fdId": pending["fdId"], "result": result})
+        user_message = "已提交审批同意。" if pending["action"] == "approve" else "已提交驳回。"
+        return _ok(
+            {
+                "ok": True,
+                "executed": True,
+                "action": pending["action"],
+                "fdId": pending["fdId"],
+                "userMessage": user_message,
+                "result": result,
+            }
+        )
 
     # New search tools: create client with session only, reject bypass params
     if name in _NEW_SEARCH_TOOL_NAMES:
@@ -1091,7 +1139,10 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             raise OAConnectorError("审批备注不能为空")
         action_label = _approval_action_label(action)
         todo = _find_current_todo(client, fd_id)
-        detail = client.get_detail(fd_id, require_in_todo=True)
+        capability = client.validate_approval_action(fd_id, action, require_in_todo=False)
+        approval_binding = capability.get("approvalBinding")
+        if not isinstance(approval_binding, dict):
+            raise OAConnectorError("无法确认当前审批任务，请重新查看这条待办")
         raw = todo.get("raw") or {}
         base_url = str(args.get("baseUrl") or client.base_url)
         pending = {
@@ -1103,6 +1154,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "note": note,
             "futureNodeId": args.get("futureNodeId"),
             "loginBinding": _approval_login_binding(session, base_url),
+            "approvalBinding": approval_binding,
         }
         token = _save_pending_approval(pending)
         summary = {
@@ -1112,17 +1164,18 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "confirmationPhrase": _approval_confirm_phrase(action),
             "summary": {
                 "fdId": fd_id,
-                "subject": todo.get("subject") or detail.get("title") or "",
+                "subject": todo.get("subject") or capability.get("title") or "",
                 "action": action,
                 "actionLabel": action_label,
                 "note": note,
                 "currentNode": _plain_text(raw.get("nodeName")),
                 "currentHandler": _plain_text(raw.get("handlerName")),
-                "detailTitle": detail.get("title", ""),
+                "detailTitle": capability.get("title", ""),
             },
             "permissionCheck": {
                 "ok": True,
-                "evidence": "该 fdId 存在于当前登录账号的 OA 待审批清单中；执行前会再次校验。",
+                "actionAvailable": True,
+                "evidence": "该单据属于当前登录账号的 OA 待审批清单，且详情页确认当前节点支持本次审批动作；执行前会再次校验。",
             },
             "nextStep": f"请把 summary 整理给用户确认。用户明确回复“{_approval_confirm_phrase(action)}”后，调用 oa_confirm_approval。",
         }

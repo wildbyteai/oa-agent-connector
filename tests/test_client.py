@@ -1,9 +1,10 @@
 import json
 import tempfile
 import unittest
+from html import escape
 from pathlib import Path
 
-from oa_agent_connector.client import OAClient, OAConnectorError, PermissionGateError
+from oa_agent_connector.client import ApprovalResultUnknownError, OAClient, OAConnectorError, PermissionGateError
 
 
 class FakeOAClient(OAClient):
@@ -31,7 +32,14 @@ class TimeoutApprovalClient(FakeOAClient):
             raise TimeoutError("timed out")
         return {"url": "https://example.invalid/oa/ok", "text": "ok"}
 
-    def _approval_action_via_ui(self, fd_id, operation_type, audit_note, future_node_id=None):
+    def _approval_action_via_ui(
+        self,
+        fd_id,
+        operation_type,
+        audit_note,
+        future_node_id=None,
+        expected_binding=None,
+    ):
         self.used_ui_fallback = True
         return {"dryRun": False, "fdId": fd_id, "transport": "ui-form", "operationType": operation_type}
 
@@ -43,6 +51,104 @@ class WrappedTimeoutApprovalClient(TimeoutApprovalClient):
         if path == "api/km-review/kmReviewRestService/approveProcess":
             raise OAConnectorError("请求 OA 失败: <urlopen error timed out>")
         return {"url": "https://example.invalid/oa/ok", "text": "ok"}
+
+
+class ViewFormApprovalClient(FakeOAClient):
+    FD_ID = "1234567890abcdef1234567890abcdef"
+
+    def __init__(
+        self,
+        operation_type="handler_pass",
+        *,
+        refuse_nodes=None,
+        refuse_to_previous=False,
+        submit_response='{"status":true}',
+        submit_exception=None,
+        pending_after_submit=None,
+        post_submit_todo_text=None,
+        default_task_id="",
+        current_node_xml=None,
+    ):
+        super().__init__(json.dumps({"rows": [{"fdId": self.FD_ID}]}))
+        self.operation_type = operation_type
+        self.refuse_nodes = refuse_nodes or ["draft-node#起草"]
+        self.refuse_to_previous = refuse_to_previous
+        self.submit_response = submit_response
+        self.submit_exception = submit_exception
+        self.pending_after_submit = pending_after_submit
+        self.post_submit_todo_text = post_submit_todo_text
+        self.default_task_id = default_task_id
+        self.current_node_xml = current_node_xml
+        self.requests = []
+        self.submitted = None
+        self.post_count = 0
+        self.post_submit_list_count = 0
+
+    def _view_html(self):
+        current_node_xml = self.current_node_xml or (
+            "<root>"
+            f'<task type="reviewWorkitem" taskFrom="workitem" id="task-1" nodeId="current-node" data="{{"key":"value"}}">'
+            f'<operation id="{self.operation_type}" operationHandlerType="handler" /></task>'
+            "</root>"
+        )
+        tran_process_xml = '<root><runningNodes><node id="current-node" /></runningNodes></root>'
+        return (
+            "<title>示例审批</title>"
+            '<form name="kmReviewMainForm" method="post">'
+            f'<input type="hidden" name="fdId" value="{self.FD_ID}" />'
+            '<input type="hidden" name="sysWfBusinessForm.fdProcessId" value="process-1" />'
+            '<input type="hidden" name="sysWfBusinessForm.fdAuditNoteFdId" value="note-1" />'
+            '<input type="hidden" name="sysWfBusinessForm.fdCurNodeXML" '
+            f'value="{escape(current_node_xml, quote=True)}" />'
+            '<input type="hidden" name="sysWfBusinessForm.fdTranProcessXML" '
+            f'value="{escape(tran_process_xml, quote=True)}" />'
+            '<input type="text" name="readOnlyBusinessField" value="ignored" disabled />'
+            '<textarea name="fdUsageContent">原意见</textarea>'
+            '<input id="process_review_button" type="button" value="提交" '
+            'onclick="Com_Submit(document.kmReviewMainForm, \'publishDraft\');" />'
+            f"<script>lbpm.defaultTaskId = '{self.default_task_id}';</script>"
+            "</form>"
+        )
+
+    def _request(self, path, method="GET", params=None, data=None):
+        call = {"path": path, "method": method, "params": params or {}, "data": data}
+        self.requests.append(call)
+        action_method = call["params"].get("method")
+        if action_method == "list":
+            if self.submitted is not None and self.post_submit_todo_text is not None:
+                self.post_submit_list_count += 1
+                return {"url": "https://example.invalid/oa/list", "text": self.post_submit_todo_text}
+            if self.submitted is not None and self.pending_after_submit is not None:
+                self.post_submit_list_count += 1
+                rows = [{"fdId": self.FD_ID}] if self.pending_after_submit else []
+                payload = {
+                    "rows": rows,
+                    "page": {"currentPage": "1", "pageSize": "200", "totalSize": str(len(rows))},
+                }
+                return {"url": "https://example.invalid/oa/list", "text": json.dumps(payload)}
+            return {"url": "https://example.invalid/oa/list", "text": self.todo_text}
+        if action_method in ("edit", "update"):
+            raise AssertionError("approval must not depend on the editable main-document page")
+        if action_method == "view":
+            return {"url": "https://example.invalid/oa/view", "text": self._view_html()}
+        if path == "sys/lbpm/engine/jsonp.jsp":
+            return {
+                "url": "https://example.invalid/oa/refuse-nodes",
+                "text": json.dumps(self.refuse_nodes, ensure_ascii=False),
+            }
+        if path == "sys/common/dataxml.jsp":
+            value = "true" if self.refuse_to_previous else "false"
+            return {
+                "url": "https://example.invalid/oa/settings",
+                "text": f'<root><data isRefuseToPrevNodeDefault="{value}" /></root>',
+            }
+        if method == "POST" and action_method == "publishDraft":
+            self.submitted = call
+            self.post_count += 1
+            if self.submit_exception is not None:
+                raise self.submit_exception
+            return {"url": "https://example.invalid/oa/success", "text": self.submit_response}
+        raise AssertionError(f"unexpected request: {call}")
 
 
 class OAClientTest(unittest.TestCase):
@@ -130,11 +236,14 @@ class OAClientTest(unittest.TestCase):
         self.assertEqual(status["loginAs"], "示例用户/技术经理")
 
     def test_approval_dry_run_requires_current_todo(self):
-        client = FakeOAClient(json.dumps({"rows": [{"fdId": "1234567890abcdef1234567890abcdef"}]}))
-        result = client.approve("1234567890abcdef1234567890abcdef", "同意")
+        client = ViewFormApprovalClient()
+        result = client.approve(client.FD_ID, "同意")
         self.assertTrue(result["dryRun"])
-        flow_param = json.loads(result["payload"]["flowParam"])
-        self.assertNotIn("handler", flow_param)
+        self.assertEqual(result["formSource"], "view")
+        self.assertEqual(result["submitMethod"], "publishDraft")
+        self.assertEqual(result["payload"]["action"], "approve")
+        self.assertNotIn("flowParam", result["payload"])
+        self.assertNotIn("handler", result["payload"])
 
         with self.assertRaises(PermissionGateError):
             client.approve("ffffffffffffffffffffffffffffffff", "同意")
@@ -153,26 +262,285 @@ class OAClientTest(unittest.TestCase):
         self.assertFalse(client.rest_attempted)
         self.assertEqual(result["transport"], "ui-form")
 
+    def test_approval_uses_view_form_when_edit_page_would_be_forbidden(self):
+        client = ViewFormApprovalClient()
+
+        result = client.approve(client.FD_ID, "同意", execute=True)
+
+        requested_methods = [call["params"].get("method") for call in client.requests]
+        self.assertIn("view", requested_methods)
+        self.assertIn("publishDraft", requested_methods)
+        self.assertNotIn("edit", requested_methods)
+        self.assertNotIn("update", requested_methods)
+        self.assertEqual(result["formSource"], "view")
+        self.assertEqual(result["submitMethod"], "publishDraft")
+        self.assertIsNotNone(client.submitted)
+        self.assertEqual(client.submitted["data"]["fdId"], client.FD_ID)
+        self.assertEqual(client.submitted["data"]["fdUsageContent"], "同意")
+        self.assertNotIn("readOnlyBusinessField", client.submitted["data"])
+        parameter = json.loads(client.submitted["data"]["sysWfBusinessForm.fdParameterJson"])
+        self.assertEqual(parameter["taskId"], "task-1")
+        self.assertEqual(parameter["operationType"], "handler_pass")
+        self.assertEqual(parameter["param"]["auditNote"], "同意")
+
+    def test_reject_uses_view_form_and_publish_draft(self):
+        client = ViewFormApprovalClient(operation_type="handler_refuse")
+
+        result = client.reject(client.FD_ID, "资料不完整", execute=True)
+
+        self.assertEqual(result["submitMethod"], "publishDraft")
+        parameter = json.loads(client.submitted["data"]["sysWfBusinessForm.fdParameterJson"])
+        self.assertEqual(parameter["operationType"], "handler_refuse")
+        self.assertEqual(parameter["param"]["jumpToNodeId"], "draft-node")
+        self.assertEqual(parameter["param"]["auditNote"], "资料不完整")
+
+    def test_reject_uses_last_node_when_oa_defaults_to_previous_node(self):
+        client = ViewFormApprovalClient(
+            operation_type="handler_refuse",
+            refuse_nodes=["first-node#起草", "previous-node#上一节点"],
+            refuse_to_previous=True,
+        )
+
+        client.reject(client.FD_ID, "资料不完整", execute=True)
+
+        parameter = json.loads(client.submitted["data"]["sysWfBusinessForm.fdParameterJson"])
+        self.assertEqual(parameter["param"]["jumpToNodeId"], "previous-node")
+
+    def test_reject_uses_first_node_when_oa_previous_node_default_is_disabled(self):
+        client = ViewFormApprovalClient(
+            operation_type="handler_refuse",
+            refuse_nodes=["first-node#起草", "previous-node#上一节点"],
+            refuse_to_previous=False,
+        )
+
+        client.reject(client.FD_ID, "资料不完整", execute=True)
+
+        parameter = json.loads(client.submitted["data"]["sysWfBusinessForm.fdParameterJson"])
+        self.assertEqual(parameter["param"]["jumpToNodeId"], "first-node")
+
     def test_find_review_workitem_handles_malformed_xml_attrs(self):
         client = FakeOAClient("{}")
         malformed_xml = (
-            '<root><task type="reviewWorkitem" id="task-1" data="{"key":"value"}">'
-            '<operations><operation id="handler_refuse" /></operations>'
+            '<root><task type="reviewWorkitem" taskFrom="workitem" id="task-1" nodeId="current-node" data="{"key":"value"}">'
+            '<operations><operation id="handler_refuse" operationHandlerType="handler" /></operations>'
             "</task></root>"
         )
         task = client._find_review_workitem(malformed_xml, "handler_refuse")
-        self.assertEqual(task, {"id": "task-1", "type": "reviewWorkitem"})
+        self.assertEqual(task, {"id": "task-1", "type": "reviewWorkitem", "nodeId": "current-node"})
 
     def test_find_review_workitem_requires_requested_operation(self):
         client = FakeOAClient("{}")
         current_node_xml = (
             "<root>"
-            '<task type="reviewWorkitem" id="pass-task"><operation id="handler_pass" /></task>'
-            '<task type="reviewWorkitem" id="refuse-task"><operation id="handler_refuse" /></task>'
+            '<task type="reviewWorkitem" taskFrom="workitem" id="pass-task" nodeId="current-node">'
+            '<operation id="handler_pass" operationHandlerType="handler" /></task>'
+            '<task type="reviewWorkitem" taskFrom="workitem" id="refuse-task" nodeId="current-node">'
+            '<operation id="handler_refuse" operationHandlerType="handler" /></task>'
             "</root>"
         )
         task = client._find_review_workitem(current_node_xml, "handler_refuse")
-        self.assertEqual(task, {"id": "refuse-task", "type": "reviewWorkitem"})
+        self.assertEqual(task, {"id": "refuse-task", "type": "reviewWorkitem", "nodeId": "current-node"})
+
+    def test_find_review_workitem_requires_native_processor_attributes(self):
+        client = FakeOAClient("{}")
+        current_node_xml = (
+            "<root>"
+            '<task type="reviewWorkitem" taskFrom="node" id="admin-task" nodeId="current-node">'
+            '<operation id="handler_pass" operationHandlerType="admin" /></task>'
+            '<task type="reviewWorkitem" id="missing-native-attrs">'
+            '<operation id="handler_pass" /></task>'
+            "</root>"
+        )
+
+        with self.assertRaisesRegex(OAConnectorError, "workitem"):
+            client._find_review_workitem(current_node_xml, "handler_pass")
+
+    def test_find_review_workitem_respects_page_default_task_id(self):
+        client = FakeOAClient("{}")
+        current_node_xml = (
+            "<root>"
+            '<task type="reviewWorkitem" taskFrom="workitem" id="task-1" nodeId="current-node">'
+            '<operation id="handler_pass" operationHandlerType="handler" /></task>'
+            '<task type="reviewWorkitem" taskFrom="workitem" id="task-2" nodeId="current-node">'
+            '<operation id="handler_pass" operationHandlerType="handler" /></task>'
+            "</root>"
+        )
+
+        task = client._find_review_workitem(current_node_xml, "handler_pass", default_task_id="task-2")
+
+        self.assertEqual(task, {"id": "task-2", "type": "reviewWorkitem", "nodeId": "current-node"})
+
+    def test_approval_form_uses_page_default_task_id(self):
+        current_node_xml = (
+            "<root>"
+            '<task type="reviewWorkitem" taskFrom="workitem" id="task-1" nodeId="current-node">'
+            '<operation id="handler_pass" operationHandlerType="handler" /></task>'
+            '<task type="reviewWorkitem" taskFrom="workitem" id="task-2" nodeId="current-node">'
+            '<operation id="handler_pass" operationHandlerType="handler" /></task>'
+            "</root>"
+        )
+        client = ViewFormApprovalClient(
+            default_task_id="task-2",
+            current_node_xml=current_node_xml,
+        )
+
+        client.approve(client.FD_ID, "同意", execute=True)
+
+        parameter = json.loads(client.submitted["data"]["sysWfBusinessForm.fdParameterJson"])
+        self.assertEqual(parameter["taskId"], "task-2")
+
+    def test_ambiguous_submit_remains_unknown_when_document_leaves_todos(self):
+        client = ViewFormApprovalClient(
+            submit_response="unexpected response",
+            pending_after_submit=False,
+        )
+
+        with self.assertRaisesRegex(ApprovalResultUnknownError, "不能证明"):
+            client.approve(client.FD_ID, "同意", execute=True)
+
+        self.assertEqual(client.post_count, 1)
+        self.assertEqual(client.post_submit_list_count, 1)
+
+    def test_ambiguous_submit_still_pending_is_not_retried(self):
+        client = ViewFormApprovalClient(
+            submit_response="unexpected response",
+            pending_after_submit=True,
+        )
+
+        with self.assertRaisesRegex(OAConnectorError, "请勿重复提交"):
+            client.approve(client.FD_ID, "同意", execute=True)
+
+        self.assertEqual(client.post_count, 1)
+        self.assertEqual(client.post_submit_list_count, 1)
+
+    def test_submit_timeout_is_read_back_once_and_remains_unknown(self):
+        client = ViewFormApprovalClient(
+            submit_exception=TimeoutError("timed out"),
+            pending_after_submit=False,
+        )
+
+        with self.assertRaisesRegex(ApprovalResultUnknownError, "不能证明"):
+            client.approve(client.FD_ID, "同意", execute=True)
+
+        self.assertEqual(client.post_count, 1)
+        self.assertEqual(client.post_submit_list_count, 1)
+
+    def test_expected_approval_binding_change_blocks_submit(self):
+        client = ViewFormApprovalClient()
+        expected_binding = {
+            "processId": "process-1",
+            "taskId": "old-task",
+            "nodeId": "current-node",
+            "activityType": "reviewWorkitem",
+            "operationType": "handler_pass",
+        }
+
+        with self.assertRaisesRegex(OAConnectorError, "流程状态已变化"):
+            client.approve(
+                client.FD_ID,
+                "同意",
+                execute=True,
+                expected_binding=expected_binding,
+            )
+
+        self.assertEqual(client.post_count, 0)
+
+    def test_reject_rechecks_binding_after_loading_refuse_rules(self):
+        class ChangingRejectClient(ViewFormApprovalClient):
+            def __init__(self):
+                super().__init__(
+                    operation_type="handler_refuse",
+                    refuse_nodes=["first-node#起草", "previous-node#上一节点"],
+                )
+                self.view_render_count = 0
+
+            def _view_html(self):
+                self.view_render_count += 1
+                if self.view_render_count > 1:
+                    self.current_node_xml = (
+                        "<root>"
+                        '<task type="reviewWorkitem" taskFrom="workitem" id="task-2" nodeId="current-node">'
+                        '<operation id="handler_refuse" operationHandlerType="handler" /></task>'
+                        "</root>"
+                    )
+                return super()._view_html()
+
+        client = ChangingRejectClient()
+        expected_binding = {
+            "processId": "process-1",
+            "taskId": "task-1",
+            "nodeId": "current-node",
+            "activityType": "reviewWorkitem",
+            "operationType": "handler_refuse",
+        }
+
+        with self.assertRaisesRegex(OAConnectorError, "流程状态已变化"):
+            client.reject(
+                client.FD_ID,
+                "资料不完整",
+                execute=True,
+                expected_binding=expected_binding,
+            )
+
+        self.assertEqual(client.post_count, 0)
+
+    def test_ambiguous_submit_does_not_treat_unknown_todo_page_as_success(self):
+        client = ViewFormApprovalClient(
+            submit_response="unexpected response",
+            post_submit_todo_text="<html><body>service unavailable</body></html>",
+        )
+
+        with self.assertRaisesRegex(OAConnectorError, "请勿重复提交"):
+            client.approve(client.FD_ID, "同意", execute=True)
+
+        self.assertEqual(client.post_count, 1)
+        self.assertEqual(client.post_submit_list_count, 1)
+
+    def test_ambiguous_submit_does_not_treat_incomplete_todo_page_as_success(self):
+        client = ViewFormApprovalClient(
+            submit_response="unexpected response",
+            post_submit_todo_text=json.dumps(
+                {
+                    "rows": [],
+                    "page": {"currentPage": "1", "pageSize": "200", "totalSize": "2"},
+                }
+            ),
+        )
+
+        with self.assertRaisesRegex(OAConnectorError, "请勿重复提交"):
+            client.approve(client.FD_ID, "同意", execute=True)
+
+        self.assertEqual(client.post_count, 1)
+        self.assertEqual(client.post_submit_list_count, 1)
+
+    def test_parse_form_fields_skips_disabled_controls(self):
+        client = FakeOAClient("{}")
+        form_data = client._parse_form_fields(
+            '<input name="enabled" value="yes" />'
+            '<input name="disabledInput" value="no" disabled />'
+            '<input name="buttonValue" value="no" type="button" />'
+            '<input name="fileValue" value="no" type="file" />'
+            '<textarea name="enabledNote">ok</textarea>'
+            '<textarea name="disabledNote" disabled>no</textarea>'
+        )
+
+        self.assertEqual(form_data, {"enabled": "yes", "enabledNote": "ok"})
+
+    def test_parse_form_fields_includes_successful_select_value(self):
+        client = FakeOAClient("{}")
+        form_data = client._parse_form_fields(
+            '<select name="selectedUsage">'
+            '<option value="first">第一项</option>'
+            '<option value="second" selected>第二项</option>'
+            "</select>"
+            '<select name="defaultUsage"><option value="default">默认项</option></select>'
+            '<select name="disabledUsage" disabled><option selected>忽略</option></select>'
+        )
+
+        self.assertEqual(
+            form_data,
+            {"selectedUsage": "second", "defaultUsage": "default"},
+        )
 
 
 class SearchSchemaTest(unittest.TestCase):

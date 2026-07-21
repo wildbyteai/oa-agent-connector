@@ -8,7 +8,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from oa_agent_connector import mcp_server
-from oa_agent_connector.client import OATodo
+from oa_agent_connector.client import ApprovalResultUnknownError, OAConnectorError, OATodo
+
+
+def fake_approval_binding(action):
+    return {
+        "processId": "process-1",
+        "taskId": "task-1",
+        "nodeId": "node-1",
+        "activityType": "reviewWorkitem",
+        "operationType": "handler_pass" if action == "approve" else "handler_refuse",
+    }
 
 
 class FakeClient:
@@ -36,10 +46,25 @@ class FakeClient:
     def get_detail(self, fd_id, require_in_todo=True):
         return {"fdId": fd_id, "title": "采购审批", "text": "采购审批详情"}
 
-    def approve(self, fd_id, audit_note, execute=False, future_node_id=None):
+    def validate_approval_action(self, fd_id, action, require_in_todo=True):
+        return {
+            "fdId": fd_id,
+            "action": action,
+            "operationAvailable": True,
+            "title": "采购审批",
+            "url": "https://example.invalid/oa/view",
+            "formSource": "view",
+            "approvalBinding": fake_approval_binding(action),
+        }
+
+    def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+        if execute and expected_binding != fake_approval_binding("approve"):
+            raise AssertionError("approval binding was not preserved")
         return {"dryRun": not execute, "fdId": fd_id, "result": fd_id}
 
-    def reject(self, fd_id, audit_note, execute=False):
+    def reject(self, fd_id, audit_note, execute=False, expected_binding=None):
+        if execute and expected_binding != fake_approval_binding("reject"):
+            raise AssertionError("approval binding was not preserved")
         return {"dryRun": not execute, "fdId": fd_id, "result": fd_id}
 
 
@@ -122,7 +147,7 @@ class MCPServerTest(unittest.TestCase):
                     raise RuntimeError("当前 cookie 未登录或已失效，请先 login")
                 return super().list_todos(page=page, page_size=page_size)
 
-            def reject(self, fd_id, audit_note, execute=False):
+            def reject(self, fd_id, audit_note, execute=False, expected_binding=None):
                 calls["reject"] += 1
                 return {"dryRun": not execute, "fdId": fd_id, "result": "rejected"}
 
@@ -156,6 +181,7 @@ class MCPServerTest(unittest.TestCase):
                             "work",
                             "https://example.invalid/oa/",
                         ),
+                        "approvalBinding": fake_approval_binding("reject"),
                     }
                 )
                 with patch.object(mcp_server, "OAClient", ConfirmReloginClient):
@@ -180,12 +206,235 @@ class MCPServerTest(unittest.TestCase):
         self.assertTrue(payload["executed"])
         self.assertEqual(calls, {"login": 1, "reject": 1})
 
+    def test_confirm_approval_rechecks_login_binding_after_auto_login(self):
+        calls = {"approve": 0}
+        auth_state = {"ready": False}
+
+        class ReloginClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                if not auth_state["ready"]:
+                    raise RuntimeError("当前 cookie 未登录或已失效，请先 login")
+                return super().list_todos(page=page, page_size=page_size)
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                calls["approve"] += 1
+                return super().approve(
+                    fd_id,
+                    audit_note,
+                    execute=execute,
+                    future_node_id=future_node_id,
+                    expected_binding=expected_binding,
+                )
+
+        def relogin(_session):
+            auth_state["ready"] = True
+            return True
+
+        fd_id = "1234567890abcdef1234567890abcdef"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                token = mcp_server._save_pending_approval(
+                    {
+                        "session": "work",
+                        "baseUrl": "https://example.invalid/oa/",
+                        "insecure": False,
+                        "fdId": fd_id,
+                        "action": "approve",
+                        "note": "同意",
+                        "futureNodeId": None,
+                        "loginBinding": "binding-before-login",
+                        "approvalBinding": fake_approval_binding("approve"),
+                    }
+                )
+                with patch.object(mcp_server, "OAClient", ReloginClient):
+                    with patch.object(mcp_server, "_auto_login_available", return_value=True):
+                        with patch.object(mcp_server, "_try_auto_login", side_effect=relogin):
+                            with patch.object(
+                                mcp_server,
+                                "_approval_login_binding",
+                                side_effect=["binding-before-login", "binding-after-login"],
+                            ):
+                                response = mcp_server.handle(
+                                    {
+                                        "jsonrpc": "2.0",
+                                        "id": 1,
+                                        "method": "tools/call",
+                                        "params": {
+                                            "name": "oa_confirm_approval",
+                                            "arguments": {
+                                                "confirmationToken": token,
+                                                "confirmationText": "确认审批",
+                                            },
+                                        },
+                                    }
+                                )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertIn("登录账号已变化", payload["reason"])
+        self.assertEqual(calls["approve"], 0)
+
+    def test_delete_pending_keeps_claim_when_source_delete_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                token = mcp_server._save_pending_approval({"session": "work"})
+                source = mcp_server._pending_path(token)
+                claimed = mcp_server._pending_claim_path(token)
+                claimed.write_bytes(source.read_bytes())
+                original_unlink = Path.unlink
+
+                def fail_source_unlink(path, *args, **kwargs):
+                    if path == source:
+                        raise PermissionError("source is locked")
+                    return original_unlink(path, *args, **kwargs)
+
+                with patch.object(Path, "unlink", new=fail_source_unlink):
+                    mcp_server._delete_pending_approval(token)
+
+                source_exists = source.exists()
+                claimed_exists = claimed.exists()
+                with self.assertRaisesRegex(OAConnectorError, "正在处理或已经使用"):
+                    mcp_server._load_pending_approval(token)
+                mcp_server._delete_pending_approval(token)
+
+        self.assertTrue(source_exists)
+        self.assertTrue(claimed_exists)
+
+    def test_confirm_approval_returns_non_retryable_unknown_result(self):
+        calls = {"approve": 0}
+
+        class UnknownResultClient(FakeClient):
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                calls["approve"] += 1
+                raise ApprovalResultUnknownError(
+                    "审批请求已经发出，但 OA 没有返回明确结果。请勿重复提交，请先在 OA 页面核对。"
+                )
+
+        fd_id = "1234567890abcdef1234567890abcdef"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                token = mcp_server._save_pending_approval(
+                    {
+                        "session": "work",
+                        "baseUrl": "https://example.invalid/oa/",
+                        "insecure": False,
+                        "fdId": fd_id,
+                        "action": "approve",
+                        "note": "同意",
+                        "futureNodeId": None,
+                        "loginBinding": mcp_server._approval_login_binding(
+                            "work",
+                            "https://example.invalid/oa/",
+                        ),
+                        "approvalBinding": fake_approval_binding("approve"),
+                    }
+                )
+                with patch.object(mcp_server, "OAClient", UnknownResultClient):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_confirm_approval",
+                                "arguments": {
+                                    "confirmationToken": token,
+                                    "confirmationText": "确认审批",
+                                },
+                            },
+                        }
+                    )
+                pending_exists = mcp_server._pending_path(token).exists()
+                claimed_exists = mcp_server._pending_claim_path(token).exists()
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["resultUnknown"])
+        self.assertTrue(payload["submittedOnce"])
+        self.assertFalse(payload["retryAllowed"])
+        self.assertIn("请勿重复提交", payload["userMessage"])
+        self.assertEqual(calls["approve"], 1)
+        self.assertFalse(pending_exists)
+        self.assertFalse(claimed_exists)
+
+    def test_confirm_approval_rejects_missing_workitem_binding(self):
+        calls = {"approve": 0}
+
+        class CountingClient(FakeClient):
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                calls["approve"] += 1
+                return super().approve(
+                    fd_id,
+                    audit_note,
+                    execute=execute,
+                    future_node_id=future_node_id,
+                    expected_binding=expected_binding,
+                )
+
+        fd_id = "1234567890abcdef1234567890abcdef"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                token = mcp_server._save_pending_approval(
+                    {
+                        "session": "work",
+                        "baseUrl": "https://example.invalid/oa/",
+                        "insecure": False,
+                        "fdId": fd_id,
+                        "action": "approve",
+                        "note": "同意",
+                        "futureNodeId": None,
+                        "loginBinding": mcp_server._approval_login_binding(
+                            "work",
+                            "https://example.invalid/oa/",
+                        ),
+                    }
+                )
+                with patch.object(mcp_server, "OAClient", CountingClient):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_confirm_approval",
+                                "arguments": {
+                                    "confirmationToken": token,
+                                    "confirmationText": "确认审批",
+                                },
+                            },
+                        }
+                    )
+                pending_exists = mcp_server._pending_path(token).exists()
+                claimed_exists = mcp_server._pending_claim_path(token).exists()
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertIn("确认状态不完整", payload["reason"])
+        self.assertEqual(calls["approve"], 0)
+        self.assertFalse(pending_exists)
+        self.assertFalse(claimed_exists)
+
     def test_confirmation_token_can_only_be_claimed_by_one_process(self):
         calls = {"reject": 0}
         calls_lock = threading.Lock()
 
         class CountingClient(FakeClient):
-            def reject(self, fd_id, audit_note, execute=False):
+            def reject(self, fd_id, audit_note, execute=False, expected_binding=None):
                 with calls_lock:
                     calls["reject"] += 1
                 return {"dryRun": not execute, "fdId": fd_id, "result": "rejected"}
@@ -211,6 +460,7 @@ class MCPServerTest(unittest.TestCase):
                             "work",
                             "https://example.invalid/oa/",
                         ),
+                        "approvalBinding": fake_approval_binding("reject"),
                     }
                 )
                 original_load = mcp_server._load_pending_approval
@@ -257,7 +507,7 @@ class MCPServerTest(unittest.TestCase):
         calls = {"reject": 0}
 
         class CountingClient(FakeClient):
-            def reject(self, fd_id, audit_note, execute=False):
+            def reject(self, fd_id, audit_note, execute=False, expected_binding=None):
                 calls["reject"] += 1
                 return {"dryRun": not execute, "fdId": fd_id}
 
@@ -951,6 +1201,7 @@ class MCPServerTest(unittest.TestCase):
                     payload = json.loads(prepared["result"]["content"][0]["text"])
                     self.assertTrue(payload["requiresUserConfirmation"])
                     self.assertEqual(payload["confirmationPhrase"], "确认审批")
+                    self.assertTrue(payload["permissionCheck"]["actionAvailable"])
 
                     confirmed = mcp_server.handle(
                         {
@@ -969,6 +1220,43 @@ class MCPServerTest(unittest.TestCase):
                     result = json.loads(confirmed["result"]["content"][0]["text"])
                     self.assertTrue(result["executed"])
                     self.assertEqual(result["fdId"], "1234567890abcdef1234567890abcdef")
+                    self.assertEqual(result["userMessage"], "已提交审批同意。")
+
+    def test_prepare_approval_rejects_action_missing_from_view_page(self):
+        class UnsupportedActionClient(FakeClient):
+            def validate_approval_action(self, fd_id, action, require_in_todo=True):
+                raise OAConnectorError("当前节点不支持本次审批动作")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                with patch.object(mcp_server, "OAClient", UnsupportedActionClient):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_prepare_approval",
+                                "arguments": {
+                                    "fdId": "1234567890abcdef1234567890abcdef",
+                                    "action": "reject",
+                                    "note": "资料不完整",
+                                },
+                            },
+                        }
+                    )
+
+                pending_dir = Path(tmpdir) / "pending-approvals"
+                pending_files = list(pending_dir.glob("*.json")) if pending_dir.exists() else []
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertIn("当前节点不支持", payload["reason"])
+        self.assertEqual(pending_files, [])
 
     def test_direct_execute_is_blocked(self):
         with tempfile.TemporaryDirectory() as tmpdir:
