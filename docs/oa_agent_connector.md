@@ -26,6 +26,10 @@
 
 MCP 正式审批还增加两层保护：准备确认摘要时就验证所选动作存在于当前 workitem；确认令牌会在网络请求前被单个进程原子占用，并绑定准备审批时的 OA 登录账号以及 `processId/taskId/nodeId/activityType/operationType`。自动登录恢复后会再次核对账号绑定；确认时任一流程绑定值变化都要求重新准备。即使状态文件删除失败，占用标记也会保留，避免旧 token 再次可用。审批只使用页面表单这一条提交路径，不会在请求超时后自动改用另一条路径再次提交。如果提交响应不明确，只查询一次当前待办获取线索；无论单据仍在还是已经离开待办，都返回“结果不明确，请勿重复提交”，不能仅凭待办消失宣称成功。
 
+批量审批使用 `oa_prepare_batch_approval` 和 `oa_confirm_batch_approval`，单次最多 20 条，可混合同意和驳回。MCP 的单条和批量正式审批都不接受手工 `futureNodeId`；需要人工选择下一节点时由用户在 OA 原生页面处理。准备阶段一次读取当前账号待办，逐条验证动作和完整 workitem 绑定，全部通过后才生成批量 token。确认阶段严格串行，每条执行前再次校验账号和待办权限；首条失败或结果不明确时停止，不执行后续项目，也不自动重试整批。批量审批不是事务，前面已经完成的项目不会回滚。
+
+防重复控制同时覆盖 token 和 workitem：token 在网络请求前原子 claim；规范化后的 `baseUrl + fdId + processId + taskId` 还会生成跨 token 的原子锁，因此两个批次或单条/批量重叠也不能同时提交同一任务。成功、结果不明确或进程中断留下的不确定锁都不会被另一个进程自动接管；必须先人工核对 OA 状态，避免待办延迟或锁接管竞态造成重复提交。每完成一条都会把进度写入 `.processing`；批量终态也保留在该文件中，相同 token 后续只能读取原结果，不能重发，过期终态会在后续 MCP 调用时清理。若 OA 已明确成功但本地进度落盘失败，连接器立即停止后续项目并返回不可重试的状态告警。
+
 ## 用法
 
 ```bash
@@ -72,6 +76,8 @@ MCP 普通授权默认使用 `oa_begin_auth` 本机授权页。`oa_login` 默认
 - `get_object_detail(record_ref)`
 - `download_attachment(record_ref, attachment_index, output_dir)`
 - `batch_search_objects(queries, scope)`
+- `prepare_approval(fd_id, action, note)` / `confirm_approval(token, confirmation_text)`
+- `prepare_batch_approval(items)` / `confirm_batch_approval(token, "确认批量审批")`
 - `approve(fd_id, note, execute=false)`
 - `reject(fd_id, note, execute=false)`
 

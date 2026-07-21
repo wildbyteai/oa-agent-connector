@@ -8,7 +8,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from oa_agent_connector import mcp_server
-from oa_agent_connector.client import ApprovalResultUnknownError, OAConnectorError, OATodo
+from oa_agent_connector.client import (
+    ApprovalResultUnknownError,
+    ApprovalStateChangedError,
+    OAConnectorError,
+    OATodo,
+)
 
 
 def fake_approval_binding(action):
@@ -1280,6 +1285,963 @@ class MCPServerTest(unittest.TestCase):
                     self.assertTrue(response["result"]["isError"])
                     payload = json.loads(response["result"]["content"][0]["text"])
                     self.assertIn("requiredFlow", payload)
+
+
+class BatchApprovalMCPServerTest(unittest.TestCase):
+    FD_IDS = [str(index) * 32 for index in range(1, 5)]
+
+    def _tool_call(self, name, arguments, message_id=1):
+        return mcp_server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+
+    def _payload(self, response):
+        return json.loads(response["result"]["content"][0]["text"])
+
+    def _todos(self):
+        return [
+            OATodo(
+                fd_id,
+                f"审批单 {index}",
+                raw={"nodeName": f"节点 {index}", "handlerName": f"审批人 {index}"},
+            )
+            for index, fd_id in enumerate(self.FD_IDS, start=1)
+        ]
+
+    def test_batch_tools_publish_strict_nested_schema(self):
+        response = mcp_server.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        )
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        self.assertIn("oa_prepare_batch_approval", tools)
+        self.assertIn("oa_confirm_batch_approval", tools)
+        self.assertNotIn(
+            "futureNodeId",
+            tools["oa_prepare_approval"]["inputSchema"]["properties"],
+        )
+        items_schema = tools["oa_prepare_batch_approval"]["inputSchema"]["properties"]["items"]
+        self.assertEqual(items_schema["minItems"], 1)
+        self.assertEqual(items_schema["maxItems"], 20)
+        self.assertFalse(items_schema["items"]["additionalProperties"])
+        self.assertNotIn("futureNodeId", items_schema["items"]["properties"])
+        self.assertEqual(
+            items_schema["items"]["required"],
+            ["fdId", "action", "note"],
+        )
+
+    def test_single_prepare_rejects_manual_future_node(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                with patch.object(mcp_server, "OAClient", FakeClient):
+                    response = self._tool_call(
+                        "oa_prepare_approval",
+                        {
+                            "fdId": self.FD_IDS[0],
+                            "action": "approve",
+                            "note": "同意",
+                            "futureNodeId": "node-2",
+                        },
+                    )
+                pending_dir = Path(tmpdir) / "pending-approvals"
+                pending_files = list(pending_dir.glob("*.json")) if pending_dir.exists() else []
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("不支持手工指定下一节点", self._payload(response)["reason"])
+        self.assertEqual(pending_files, [])
+
+    def test_single_confirm_rejects_legacy_token_with_future_node(self):
+        calls = {"approve": 0}
+
+        class CountingClient(FakeClient):
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                calls["approve"] += 1
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                token = mcp_server._save_pending_approval(
+                    {
+                        "kind": "single",
+                        "session": "work",
+                        "baseUrl": "https://example.invalid/oa/",
+                        "insecure": False,
+                        "fdId": self.FD_IDS[0],
+                        "action": "approve",
+                        "note": "同意",
+                        "futureNodeId": "node-2",
+                        "loginBinding": mcp_server._approval_login_binding(
+                            "work",
+                            "https://example.invalid/oa/",
+                        ),
+                        "approvalBinding": fake_approval_binding("approve"),
+                    }
+                )
+                with patch.object(mcp_server, "OAClient", CountingClient):
+                    response = self._tool_call(
+                        "oa_confirm_approval",
+                        {"confirmationToken": token, "confirmationText": "确认审批"},
+                    )
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("不支持手工指定下一节点", self._payload(response)["reason"])
+        self.assertEqual(calls["approve"], 0)
+
+    def test_batch_item_validation_rejects_empty_oversized_duplicate_and_unknown_fields(self):
+        with self.assertRaisesRegex(OAConnectorError, "至少需要 1 条"):
+            mcp_server._normalize_batch_approval_items([])
+        with self.assertRaisesRegex(OAConnectorError, "最多 20 条"):
+            mcp_server._normalize_batch_approval_items(
+                [
+                    {"fdId": f"{index:032x}", "action": "approve", "note": "同意"}
+                    for index in range(21)
+                ]
+            )
+        with self.assertRaisesRegex(OAConnectorError, "不能.*重复"):
+            mcp_server._normalize_batch_approval_items(
+                [
+                    {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"},
+                    {"fdId": self.FD_IDS[0], "action": "reject", "note": "退回"},
+                ]
+            )
+        with self.assertRaisesRegex(OAConnectorError, "不支持的参数"):
+            mcp_server._normalize_batch_approval_items(
+                [
+                    {
+                        "fdId": self.FD_IDS[0],
+                        "action": "approve",
+                        "note": "同意",
+                        "execute": True,
+                    }
+                ]
+            )
+        with self.assertRaisesRegex(OAConnectorError, "不支持手工指定下一节点"):
+            mcp_server._normalize_batch_approval_items(
+                [
+                    {
+                        "fdId": self.FD_IDS[0],
+                        "action": "reject",
+                        "note": "退回",
+                        "futureNodeId": "node-2",
+                    }
+                ]
+            )
+
+    def test_batch_prepare_is_all_or_nothing_and_reads_todos_once(self):
+        test_case = self
+        calls = {"list": 0, "validate": []}
+
+        class PrepareFailureClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                calls["list"] += 1
+                return test_case._todos()[:2]
+
+            def validate_approval_action(self, fd_id, action, require_in_todo=True):
+                calls["validate"].append(fd_id)
+                if fd_id == test_case.FD_IDS[1]:
+                    raise OAConnectorError("当前节点不支持本次审批动作")
+                return super().validate_approval_action(fd_id, action, require_in_todo)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session(
+                    "work",
+                    "https://example.invalid/oa/",
+                    login_account="u001",
+                )
+                with patch.object(mcp_server, "OAClient", PrepareFailureClient):
+                    response = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"},
+                                {"fdId": self.FD_IDS[1], "action": "reject", "note": "退回"},
+                            ],
+                        },
+                    )
+                pending_dir = Path(tmpdir) / "pending-approvals"
+                pending_files = list(pending_dir.glob("*.json")) if pending_dir.exists() else []
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(calls["list"], 1)
+        self.assertEqual(calls["validate"], self.FD_IDS[:2])
+        self.assertEqual(pending_files, [])
+
+    def test_mixed_batch_executes_in_order_after_one_confirmation(self):
+        test_case = self
+        events = []
+        calls = {"list": 0}
+
+        class MixedBatchClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                calls["list"] += 1
+                return test_case._todos()[:3]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                self.assert_binding(expected_binding, "approve")
+                events.append((fd_id, "approve", audit_note))
+                return {"result": "success"}
+
+            def reject(self, fd_id, audit_note, execute=False, expected_binding=None):
+                self.assert_binding(expected_binding, "reject")
+                events.append((fd_id, "reject", audit_note))
+                return {"result": "success"}
+
+            @staticmethod
+            def assert_binding(binding, action):
+                if binding != fake_approval_binding(action):
+                    raise AssertionError("approval binding was not preserved")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", MixedBatchClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意 1"},
+                                {"fdId": self.FD_IDS[1], "action": "reject", "note": "退回 2"},
+                                {"fdId": self.FD_IDS[2], "action": "approve", "note": "同意 3"},
+                            ],
+                        },
+                    )
+                    prepared_payload = self._payload(prepared)
+                    self.assertEqual(calls["list"], 1)
+                    self.assertEqual(prepared_payload["confirmationPhrase"], "确认批量审批")
+                    self.assertTrue(prepared_payload["batchNonTransactional"])
+                    confirmed = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {
+                            "confirmationToken": prepared_payload["confirmationToken"],
+                            "confirmationText": "确认批量审批",
+                        },
+                        message_id=2,
+                    )
+
+        payload = self._payload(confirmed)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["completedCount"], 3)
+        self.assertEqual([item["status"] for item in payload["completedItems"]], ["completed"] * 3)
+        self.assertEqual(
+            events,
+            [
+                (self.FD_IDS[0], "approve", "同意 1"),
+                (self.FD_IDS[1], "reject", "退回 2"),
+                (self.FD_IDS[2], "approve", "同意 3"),
+            ],
+        )
+
+    def test_batch_stops_after_first_failure_and_reports_partial_completion(self):
+        test_case = self
+        events = []
+
+        class StateChangedClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:3]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                events.append((fd_id, "approve"))
+                return {"result": "success"}
+
+            def reject(self, fd_id, audit_note, execute=False, expected_binding=None):
+                events.append((fd_id, "reject"))
+                raise ApprovalStateChangedError("审批流程状态已变化，请重新准备审批并再次确认")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", StateChangedClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"},
+                                {"fdId": self.FD_IDS[1], "action": "reject", "note": "退回"},
+                                {"fdId": self.FD_IDS[2], "action": "approve", "note": "同意"},
+                            ],
+                        },
+                    )
+                    token = self._payload(prepared)["confirmationToken"]
+                    confirmed = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {"confirmationToken": token, "confirmationText": "确认批量审批"},
+                        message_id=2,
+                    )
+
+        self.assertTrue(confirmed["result"]["isError"])
+        payload = self._payload(confirmed)
+        self.assertTrue(payload["partialCompletion"])
+        self.assertEqual(payload["completedCount"], 1)
+        self.assertEqual(payload["completedItems"][0]["fdId"], self.FD_IDS[0])
+        self.assertEqual(payload["currentItem"]["fdId"], self.FD_IDS[1])
+        self.assertEqual(payload["currentItem"]["status"], "failed")
+        self.assertEqual([item["fdId"] for item in payload["notAttemptedItems"]], [self.FD_IDS[2]])
+        self.assertFalse(payload["retryAllowed"])
+        self.assertEqual(events, [(self.FD_IDS[0], "approve"), (self.FD_IDS[1], "reject")])
+
+    def test_batch_unknown_result_stops_without_retrying_or_running_later_items(self):
+        test_case = self
+        events = []
+
+        class UnknownBatchClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:3]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                events.append(fd_id)
+                if fd_id == test_case.FD_IDS[1]:
+                    raise ApprovalResultUnknownError("审批请求已经发出，但 OA 没有返回明确结果。请勿重复提交。")
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", UnknownBatchClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"},
+                                {"fdId": self.FD_IDS[1], "action": "approve", "note": "同意"},
+                                {"fdId": self.FD_IDS[2], "action": "approve", "note": "同意"},
+                            ],
+                        },
+                    )
+                    confirmed = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {
+                            "confirmationToken": self._payload(prepared)["confirmationToken"],
+                            "confirmationText": "确认批量审批",
+                        },
+                        message_id=2,
+                    )
+
+        payload = self._payload(confirmed)
+        self.assertTrue(payload["resultUnknown"])
+        self.assertTrue(payload["submittedOnce"])
+        self.assertFalse(payload["retryAllowed"])
+        self.assertEqual(payload["completedCount"], 1)
+        self.assertEqual(payload["currentItem"]["status"], "resultUnknown")
+        self.assertEqual(events, self.FD_IDS[:2])
+        self.assertFalse(mcp_server._can_retry_after_auto_login("oa_confirm_batch_approval"))
+
+    def test_batch_confirmation_token_can_only_be_claimed_once(self):
+        test_case = self
+        calls = {"approve": 0}
+        calls_lock = threading.Lock()
+
+        class ConcurrentBatchClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:1]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                with calls_lock:
+                    calls["approve"] += 1
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", ConcurrentBatchClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"}
+                            ],
+                        },
+                    )
+                    token = self._payload(prepared)["confirmationToken"]
+                    original_load = mcp_server._load_pending_approval
+                    load_barrier = threading.Barrier(2)
+
+                    def synchronized_load(value):
+                        pending = original_load(value)
+                        load_barrier.wait(timeout=5)
+                        return pending
+
+                    responses = []
+
+                    def confirm(message_id):
+                        responses.append(
+                            self._tool_call(
+                                "oa_confirm_batch_approval",
+                                {
+                                    "confirmationToken": token,
+                                    "confirmationText": "确认批量审批",
+                                },
+                                message_id=message_id,
+                            )
+                        )
+
+                    with patch.object(mcp_server, "_load_pending_approval", side_effect=synchronized_load):
+                        threads = [threading.Thread(target=confirm, args=(message_id,)) for message_id in (2, 3)]
+                        for thread in threads:
+                            thread.start()
+                        for thread in threads:
+                            thread.join(timeout=5)
+                            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(calls["approve"], 1)
+        self.assertEqual(sum(not response["result"].get("isError", False) for response in responses), 1)
+
+    def test_distinct_batch_tokens_cannot_submit_same_workitem_concurrently(self):
+        test_case = self
+        calls = {"approve": 0}
+        calls_lock = threading.Lock()
+
+        class OverlappingBatchClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:1]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                with calls_lock:
+                    calls["approve"] += 1
+                time.sleep(0.05)
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", OverlappingBatchClient):
+                    tokens = []
+                    for message_id in (1, 2):
+                        prepared = self._tool_call(
+                            "oa_prepare_batch_approval",
+                            {
+                                "session": "work",
+                                "items": [
+                                    {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"}
+                                ],
+                            },
+                            message_id=message_id,
+                        )
+                        tokens.append(self._payload(prepared)["confirmationToken"])
+
+                    start_barrier = threading.Barrier(2)
+                    responses = []
+
+                    def confirm(message_id, token):
+                        start_barrier.wait(timeout=5)
+                        responses.append(
+                            self._tool_call(
+                                "oa_confirm_batch_approval",
+                                {
+                                    "confirmationToken": token,
+                                    "confirmationText": "确认批量审批",
+                                },
+                                message_id=message_id,
+                            )
+                        )
+
+                    threads = [
+                        threading.Thread(target=confirm, args=(message_id, token))
+                        for message_id, token in zip((3, 4), tokens)
+                    ]
+                    for thread in threads:
+                        thread.start()
+                    for thread in threads:
+                        thread.join(timeout=5)
+                        self.assertFalse(thread.is_alive())
+
+        payloads = [self._payload(response) for response in responses]
+        self.assertEqual(calls["approve"], 1)
+        self.assertEqual(sum(bool(payload.get("ok")) for payload in payloads), 1)
+        blocked = next(payload for payload in payloads if not payload.get("ok"))
+        self.assertIn("另一个确认流程", blocked["reason"])
+        self.assertFalse(blocked["retryAllowed"])
+
+    def test_equivalent_base_urls_share_the_same_workitem_lock(self):
+        item = {
+            "fdId": self.FD_IDS[0],
+            "action": "approve",
+            "note": "同意",
+            "approvalBinding": fake_approval_binding("approve"),
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                first = mcp_server._approval_workitem_lock_path(
+                    {"baseUrl": "https://EXAMPLE.invalid:443/x/../oa/"},
+                    item,
+                )
+                second = mcp_server._approval_workitem_lock_path(
+                    {"baseUrl": "https://example.invalid/oa"},
+                    item,
+                )
+
+        self.assertEqual(first, second)
+
+    def test_existing_workitem_lock_is_never_auto_replaced(self):
+        item = {
+            "fdId": self.FD_IDS[0],
+            "action": "approve",
+            "note": "同意",
+            "approvalBinding": fake_approval_binding("approve"),
+        }
+        pending = {"baseUrl": "https://example.invalid/oa/"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                path = mcp_server._acquire_approval_workitem_lock(pending, item, "token-one")
+                lock_data = json.loads(path.read_text(encoding="utf-8"))
+                lock_data["expiresAt"] = 0
+                path.write_text(json.dumps(lock_data), encoding="utf-8")
+                with self.assertRaisesRegex(OAConnectorError, "另一个确认流程"):
+                    mcp_server._acquire_approval_workitem_lock(pending, item, "token-two")
+                mcp_server._release_approval_workitem_lock(path, "token-one")
+
+    def test_batch_terminal_result_can_be_read_again_without_resubmitting(self):
+        test_case = self
+        calls = {"approve": 0}
+
+        class TerminalReadbackClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:1]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                calls["approve"] += 1
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", TerminalReadbackClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"}
+                            ],
+                        },
+                    )
+                    token = self._payload(prepared)["confirmationToken"]
+                    first = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {"confirmationToken": token, "confirmationText": "确认批量审批"},
+                        message_id=2,
+                    )
+                    processing_exists = mcp_server._pending_claim_path(token).exists()
+                    second = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {"confirmationToken": token, "confirmationText": "确认批量审批"},
+                        message_id=3,
+                    )
+                    mcp_server._save_session(
+                        "work",
+                        "https://example.invalid/oa/",
+                        login_account="u002",
+                    )
+                    switched_account = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {"confirmationToken": token, "confirmationText": "确认批量审批"},
+                        message_id=4,
+                    )
+
+        self.assertTrue(self._payload(first)["ok"])
+        self.assertEqual(self._payload(first), self._payload(second))
+        self.assertTrue(processing_exists)
+        self.assertEqual(calls["approve"], 1)
+        self.assertTrue(switched_account["result"]["isError"])
+        switched_text = switched_account["result"]["content"][0]["text"]
+        self.assertIn("登录账号已变化", switched_text)
+        self.assertNotIn("审批单 1", switched_text)
+
+    def test_expired_batch_terminal_is_cleaned_on_next_tool_call(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                path = mcp_server._pending_claim_path("expired-terminal")
+                mcp_server._ensure_private_dir(path.parent)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "kind": "batch",
+                            "terminalResult": {"isError": False, "payload": {"ok": True}},
+                            "terminalExpiresAt": int(time.time()) - 1,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                mcp_server.call_tool("oa_setup_guide", {})
+                exists_after_cleanup = path.exists()
+
+        self.assertFalse(exists_after_cleanup)
+
+    def test_single_and_batch_tokens_share_workitem_duplicate_lock(self):
+        test_case = self
+        calls = {"approve": 0}
+
+        class CrossFlowClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:1]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                calls["approve"] += 1
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", CrossFlowClient):
+                    single = self._tool_call(
+                        "oa_prepare_approval",
+                        {
+                            "session": "work",
+                            "fdId": self.FD_IDS[0],
+                            "action": "approve",
+                            "note": "同意",
+                        },
+                    )
+                    batch = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"}
+                            ],
+                        },
+                        message_id=2,
+                    )
+                    single_result = self._tool_call(
+                        "oa_confirm_approval",
+                        {
+                            "confirmationToken": self._payload(single)["confirmationToken"],
+                            "confirmationText": "确认审批",
+                        },
+                        message_id=3,
+                    )
+                    batch_result = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {
+                            "confirmationToken": self._payload(batch)["confirmationToken"],
+                            "confirmationText": "确认批量审批",
+                        },
+                        message_id=4,
+                    )
+
+        self.assertTrue(self._payload(single_result)["ok"])
+        self.assertTrue(batch_result["result"]["isError"])
+        self.assertIn("刚刚提交", self._payload(batch_result)["reason"])
+        self.assertEqual(calls["approve"], 1)
+
+    def test_progress_write_failure_after_success_stops_before_next_item(self):
+        test_case = self
+        events = []
+
+        class PersistenceFailureClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:2]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                events.append(fd_id)
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", PersistenceFailureClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"},
+                                {"fdId": self.FD_IDS[1], "action": "approve", "note": "同意"},
+                            ],
+                        },
+                    )
+                    token = self._payload(prepared)["confirmationToken"]
+                    original_save = mcp_server._save_batch_progress
+                    save_calls = {"count": 0}
+
+                    def fail_after_first_write(*args, **kwargs):
+                        save_calls["count"] += 1
+                        if save_calls["count"] >= 2:
+                            raise OSError("disk full")
+                        return original_save(*args, **kwargs)
+
+                    with patch.object(
+                        mcp_server,
+                        "_save_batch_progress",
+                        side_effect=fail_after_first_write,
+                    ):
+                        first = self._tool_call(
+                            "oa_confirm_batch_approval",
+                            {"confirmationToken": token, "confirmationText": "确认批量审批"},
+                            message_id=2,
+                        )
+                    second = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {"confirmationToken": token, "confirmationText": "确认批量审批"},
+                        message_id=3,
+                    )
+
+        payload = self._payload(first)
+        self.assertTrue(first["result"]["isError"])
+        self.assertTrue(payload["statePersistenceWarning"])
+        self.assertEqual(payload["completedCount"], 1)
+        self.assertEqual([item["fdId"] for item in payload["notAttemptedItems"]], [self.FD_IDS[1]])
+        self.assertEqual(self._payload(second), payload)
+        self.assertEqual(events, [self.FD_IDS[0]])
+
+    def test_final_progress_write_failure_does_not_report_partial_completion(self):
+        test_case = self
+        events = []
+
+        class FinalPersistenceFailureClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:1]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                events.append(fd_id)
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", FinalPersistenceFailureClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"}
+                            ],
+                        },
+                    )
+                    token = self._payload(prepared)["confirmationToken"]
+                    original_save = mcp_server._save_batch_progress
+                    save_calls = {"count": 0}
+
+                    def fail_final_write(*args, **kwargs):
+                        save_calls["count"] += 1
+                        if save_calls["count"] >= 2:
+                            raise OSError("disk full")
+                        return original_save(*args, **kwargs)
+
+                    with patch.object(
+                        mcp_server,
+                        "_save_batch_progress",
+                        side_effect=fail_final_write,
+                    ):
+                        response = self._tool_call(
+                            "oa_confirm_batch_approval",
+                            {"confirmationToken": token, "confirmationText": "确认批量审批"},
+                            message_id=2,
+                        )
+
+        payload = self._payload(response)
+        self.assertTrue(response["result"]["isError"])
+        self.assertTrue(payload["statePersistenceWarning"])
+        self.assertTrue(payload["oaCompletedAllItems"])
+        self.assertFalse(payload["partialCompletion"])
+        self.assertFalse(payload["stopped"])
+        self.assertEqual(payload["completedCount"], payload["totalCount"])
+        self.assertEqual(payload["notAttemptedCount"], 0)
+        self.assertNotIn("剩余项目未执行", payload["userMessage"])
+        self.assertEqual(events, [self.FD_IDS[0]])
+
+    def test_batch_confirmation_stops_if_login_account_changes(self):
+        test_case = self
+        events = []
+
+        class AccountBoundClient(FakeClient):
+            def list_todos(self, page=1, page_size=20):
+                return test_case._todos()[:1]
+
+            def approve(self, fd_id, audit_note, execute=False, future_node_id=None, expected_binding=None):
+                events.append(fd_id)
+                return {"result": "success"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u001")
+                with patch.object(mcp_server, "OAClient", AccountBoundClient):
+                    prepared = self._tool_call(
+                        "oa_prepare_batch_approval",
+                        {
+                            "session": "work",
+                            "items": [
+                                {"fdId": self.FD_IDS[0], "action": "approve", "note": "同意"}
+                            ],
+                        },
+                    )
+                    mcp_server._save_session("work", "https://example.invalid/oa/", login_account="u002")
+                    confirmed = self._tool_call(
+                        "oa_confirm_batch_approval",
+                        {
+                            "confirmationToken": self._payload(prepared)["confirmationToken"],
+                            "confirmationText": "确认批量审批",
+                        },
+                        message_id=2,
+                    )
+
+        payload = self._payload(confirmed)
+        self.assertTrue(confirmed["result"]["isError"])
+        self.assertIn("登录账号已变化", payload["reason"])
+        self.assertEqual(payload["completedCount"], 0)
+        self.assertEqual(events, [])
+
+    def test_single_and_batch_confirmation_tokens_cannot_be_cross_used(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                single_token = mcp_server._save_pending_approval(
+                    {"kind": "single", "action": "approve", "session": "work"}
+                )
+                batch_token = mcp_server._save_pending_approval(
+                    {"kind": "batch", "session": "work", "items": []}
+                )
+                batch_response = self._tool_call(
+                    "oa_confirm_batch_approval",
+                    {"confirmationToken": single_token, "confirmationText": "确认批量审批"},
+                )
+                single_response = self._tool_call(
+                    "oa_confirm_approval",
+                    {"confirmationToken": batch_token, "confirmationText": "确认审批"},
+                    message_id=2,
+                )
+                single_exists = mcp_server._pending_path(single_token).exists()
+                batch_exists = mcp_server._pending_path(batch_token).exists()
+
+        self.assertTrue(batch_response["result"]["isError"])
+        self.assertTrue(single_response["result"]["isError"])
+        self.assertTrue(single_exists)
+        self.assertTrue(batch_exists)
+
+    def test_batch_wrong_confirmation_phrase_does_not_consume_token(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                token = mcp_server._save_pending_approval(
+                    {"kind": "batch", "session": "work", "items": []}
+                )
+                response = self._tool_call(
+                    "oa_confirm_batch_approval",
+                    {"confirmationToken": token, "confirmationText": "确认"},
+                )
+                source_exists = mcp_server._pending_path(token).exists()
+                claim_exists = mcp_server._pending_claim_path(token).exists()
+
+        self.assertTrue(response["result"]["isError"])
+        payload = self._payload(response)
+        self.assertIn("确认批量审批", payload["reason"])
+        self.assertTrue(source_exists)
+        self.assertFalse(claim_exists)
+
+    def test_batch_progress_survives_process_interruption(self):
+        items = [
+            {
+                "fdId": self.FD_IDS[0],
+                "action": "approve",
+                "note": "同意 1",
+                "approvalBinding": fake_approval_binding("approve"),
+            },
+            {
+                "fdId": self.FD_IDS[1],
+                "action": "approve",
+                "note": "同意 2",
+                "approvalBinding": fake_approval_binding("approve"),
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict("os.environ", {"OA_AGENT_STATE_DIR": tmpdir}, clear=False):
+                token = mcp_server._save_pending_approval(
+                    {
+                        "kind": "batch",
+                        "session": "work",
+                        "baseUrl": "https://example.invalid/oa/",
+                        "insecure": False,
+                        "loginBinding": "binding",
+                        "items": items,
+                    }
+                )
+                executions = {"count": 0}
+
+                def execute(_client, _item):
+                    executions["count"] += 1
+                    if executions["count"] == 2:
+                        raise KeyboardInterrupt()
+                    return {"result": "success"}
+
+                with patch.object(mcp_server, "_approval_client_for_pending", return_value=object()):
+                    with patch.object(mcp_server, "_execute_bound_approval", side_effect=execute):
+                        with self.assertRaises(KeyboardInterrupt):
+                            mcp_server.call_tool(
+                                "oa_confirm_batch_approval",
+                                {
+                                    "confirmationToken": token,
+                                    "confirmationText": "确认批量审批",
+                                },
+                            )
+                progress = json.loads(
+                    mcp_server._pending_claim_path(token).read_text(encoding="utf-8")
+                )["batchProgress"]
+
+        self.assertEqual(len(progress["completedItems"]), 1)
+        self.assertEqual(progress["completedItems"][0]["fdId"], self.FD_IDS[0])
+        self.assertEqual(progress["currentItem"]["fdId"], self.FD_IDS[1])
+        self.assertEqual(progress["currentItem"]["status"], "executing")
 
 
 class SearchMCPServerTest(unittest.TestCase):

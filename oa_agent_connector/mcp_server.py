@@ -4,6 +4,7 @@ import hashlib
 import re
 import json
 import os
+import posixpath
 import secrets
 import sys
 import time
@@ -19,7 +20,10 @@ from .security import sanitize_error_message
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.10"
+SERVER_VERSION = "0.2.11"
+MAX_BATCH_APPROVAL_ITEMS = 20
+BATCH_APPROVAL_CONFIRM_PHRASE = "确认批量审批"
+BATCH_TERMINAL_RESULT_TTL_SECONDS = 3600
 
 
 def _state_dir() -> Path:
@@ -89,6 +93,10 @@ def _pending_path(token: str) -> Path:
 def _pending_claim_path(token: str) -> Path:
     safe = "".join(ch for ch in token if ch.isalnum() or ch in ("-", "_"))
     return _pending_dir() / f"{safe}.processing"
+
+
+def _approval_workitem_lock_dir() -> Path:
+    return _state_dir() / "approval-workitem-locks"
 
 
 def _transport_confirmation_dir() -> Path:
@@ -276,11 +284,32 @@ def _can_retry_after_auto_login(tool_name: str) -> bool:
         "oa_local_auth_status",
         "oa_login",
         "oa_confirm_approval",
+        "oa_confirm_batch_approval",
     }
 
 
 def _absolute_url(base_url: str, path: str) -> str:
     return urllib.parse.urljoin(str(base_url).rstrip("/") + "/", str(path or "").lstrip("/"))
+
+
+def _canonical_base_url(base_url: str) -> str:
+    parsed = urllib.parse.urlsplit(str(base_url or "").strip())
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    if not scheme or not hostname:
+        raise OAConnectorError("OA 地址格式不正确")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise OAConnectorError("OA 地址格式不正确") from exc
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        host = f"{host}:{port}"
+    decoded_path = urllib.parse.unquote(parsed.path or "/")
+    normalized_path = posixpath.normpath("/" + decoded_path.lstrip("/"))
+    if normalized_path != "/":
+        normalized_path = normalized_path.rstrip("/")
+    return urllib.parse.urlunsplit((scheme, host, normalized_path, "", ""))
 
 
 def _ok(data: Any) -> Dict[str, Any]:
@@ -406,7 +435,7 @@ def _approval_login_binding(session: str, base_url: str) -> str:
     login_account = str(meta.get("loginAccount") or "").strip()
     if not login_account:
         raise OAConnectorError("无法确认当前 OA 登录账号，请重新授权后再准备审批")
-    normalized_base_url = str(base_url or meta.get("baseUrl") or "").strip().rstrip("/").lower()
+    normalized_base_url = _canonical_base_url(str(base_url or meta.get("baseUrl") or ""))
     return hashlib.sha256(
         f"{normalized_base_url}\n{session}\n{login_account}".encode("utf-8")
     ).hexdigest()
@@ -417,6 +446,154 @@ def _find_current_todo(client: OAClient, fd_id: str) -> Dict[str, Any]:
         if todo.fd_id == fd_id:
             return todo.to_dict()
     raise OAConnectorError(f"拒绝操作：{fd_id} 不在当前登录账号的待审批列表中")
+
+
+def _approval_binding_complete(binding: Any) -> bool:
+    return isinstance(binding, dict) and all(
+        str(binding.get(key) or "").strip()
+        for key in ("processId", "taskId", "nodeId", "activityType", "operationType")
+    )
+
+
+def _approval_client_for_pending(pending: Dict[str, Any], fd_id: str) -> OAClient:
+    pending_session = str(pending["session"])
+    base_url = str(pending["baseUrl"])
+    current_binding = _approval_login_binding(pending_session, base_url)
+    if not pending.get("loginBinding") or pending["loginBinding"] != current_binding:
+        raise OAConnectorError("OA 登录账号已变化，请重新准备审批并再次确认")
+
+    client = _client(
+        session=pending_session,
+        base_url=base_url,
+        insecure=bool(pending.get("insecure")),
+    )
+    try:
+        _find_current_todo(client, fd_id)
+    except Exception as exc:
+        if not (
+            _auth_required_reason(str(exc))
+            and _auto_login_available(pending_session)
+            and _try_auto_login(pending_session)
+        ):
+            raise
+        client = _client(
+            session=pending_session,
+            base_url=base_url,
+            insecure=bool(pending.get("insecure")),
+        )
+        try:
+            _find_current_todo(client, fd_id)
+        except Exception as retry_exc:
+            if _auth_required_reason(str(retry_exc)):
+                _block_auto_login(pending_session)
+            raise
+
+    current_binding = _approval_login_binding(pending_session, base_url)
+    if not pending.get("loginBinding") or pending["loginBinding"] != current_binding:
+        raise OAConnectorError("OA 登录账号已变化，请重新准备审批并再次确认")
+    return client
+
+
+def _execute_bound_approval(client: OAClient, item: Dict[str, Any]) -> Dict[str, Any]:
+    binding = item.get("approvalBinding")
+    if not _approval_binding_complete(binding):
+        raise OAConnectorError("审批确认状态不完整，请重新准备审批并再次确认")
+    if item["action"] == "approve":
+        return client.approve(
+            str(item["fdId"]),
+            str(item["note"]),
+            execute=True,
+            future_node_id=item.get("futureNodeId"),
+            expected_binding=binding,
+        )
+    if item["action"] == "reject":
+        return client.reject(
+            str(item["fdId"]),
+            str(item["note"]),
+            execute=True,
+            expected_binding=binding,
+        )
+    raise OAConnectorError("审批动作只允许 approve 或 reject")
+
+
+def _normalize_batch_approval_items(raw_items: Any) -> list[Dict[str, Any]]:
+    if not isinstance(raw_items, list) or not raw_items:
+        raise OAConnectorError("批量审批至少需要 1 条单据")
+    if len(raw_items) > MAX_BATCH_APPROVAL_ITEMS:
+        raise OAConnectorError(f"单次批量审批最多 {MAX_BATCH_APPROVAL_ITEMS} 条")
+
+    allowed_keys = {"fdId", "action", "note"}
+    normalized: list[Dict[str, Any]] = []
+    seen_fd_ids = set()
+    for index, raw in enumerate(raw_items, start=1):
+        if not isinstance(raw, dict):
+            raise OAConnectorError(f"批量审批第 {index} 条格式不正确")
+        if "futureNodeId" in raw:
+            raise OAConnectorError("MCP 正式审批不支持手工指定下一节点，请在 OA 页面处理")
+        unknown_keys = set(raw) - allowed_keys
+        if unknown_keys:
+            raise OAConnectorError(f"批量审批第 {index} 条包含不支持的参数")
+        if not isinstance(raw.get("fdId"), str):
+            raise OAConnectorError(f"批量审批第 {index} 条单据格式不正确")
+        if not isinstance(raw.get("action"), str):
+            raise OAConnectorError(f"批量审批第 {index} 条动作格式不正确")
+        if not isinstance(raw.get("note"), str):
+            raise OAConnectorError(f"批量审批第 {index} 条备注格式不正确")
+        fd_id = raw["fdId"].strip()
+        action = raw["action"].strip()
+        note = raw["note"].strip()
+        if not fd_id:
+            raise OAConnectorError(f"批量审批第 {index} 条缺少单据")
+        if fd_id in seen_fd_ids:
+            raise OAConnectorError("同一条单据不能在一次批量审批中重复出现")
+        _approval_action_label(action)
+        if not note:
+            raise OAConnectorError(f"批量审批第 {index} 条备注不能为空")
+        seen_fd_ids.add(fd_id)
+        normalized.append(
+            {
+                "fdId": fd_id,
+                "action": action,
+                "note": note,
+            }
+        )
+    return normalized
+
+
+def _batch_item_public(item: Dict[str, Any], index: int) -> Dict[str, Any]:
+    result = {
+        "index": index,
+        "fdId": item["fdId"],
+        "subject": item.get("subject") or item.get("detailTitle") or "",
+        "action": item["action"],
+        "actionLabel": _approval_action_label(str(item["action"])),
+        "note": item["note"],
+        "currentNode": item.get("currentNode") or "",
+        "currentHandler": item.get("currentHandler") or "",
+    }
+    if item.get("detailUrl"):
+        result["detailUrl"] = item["detailUrl"]
+    return result
+
+
+def _batch_item_with_status(
+    item: Dict[str, Any],
+    index: int,
+    status: str,
+    reason: str = "",
+) -> Dict[str, Any]:
+    result = _batch_item_public(item, index)
+    result["status"] = status
+    if reason:
+        result["reason"] = _redact_tool_message(reason)
+    return result
+
+
+def _pending_approval_kind(pending: Dict[str, Any]) -> str:
+    kind = str(pending.get("kind") or "single")
+    if kind not in {"single", "batch"}:
+        raise OAConnectorError("审批确认状态格式不正确，请重新准备审批")
+    return kind
 
 
 def _save_pending_approval(data: Dict[str, Any]) -> str:
@@ -529,6 +706,317 @@ def _claim_pending_approval(token: str) -> Dict[str, Any]:
         if fd >= 0:
             os.close(fd)
         raise
+
+
+def _atomic_write_private_json(path: Path, data: Dict[str, Any], *, require_exists: bool = False) -> None:
+    if require_exists and not path.exists():
+        raise OAConnectorError("审批确认状态已经不可用，请重新准备审批")
+    _ensure_private_dir(path.parent)
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    temp_path = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _write_claimed_approval(token: str, data: Dict[str, Any]) -> None:
+    _atomic_write_private_json(_pending_claim_path(token), data, require_exists=True)
+
+
+def _approval_workitem_lock_path(pending: Dict[str, Any], item: Dict[str, Any]) -> Path:
+    binding = item.get("approvalBinding")
+    if not _approval_binding_complete(binding):
+        raise OAConnectorError("审批确认状态不完整，请重新准备审批并再次确认")
+    normalized_base_url = _canonical_base_url(str(pending.get("baseUrl") or ""))
+    lock_key = hashlib.sha256(
+        (
+            f"{normalized_base_url}\n"
+            f"{str(item.get('fdId') or '').strip()}\n"
+            f"{str(binding['processId']).strip()}\n"
+            f"{str(binding['taskId']).strip()}"
+        ).encode("utf-8")
+    ).hexdigest()
+    return _approval_workitem_lock_dir() / f"{lock_key}.lock"
+
+
+def _approval_workitem_lock_owner(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _acquire_approval_workitem_lock(
+    pending: Dict[str, Any],
+    item: Dict[str, Any],
+    token: str,
+) -> Path:
+    path = _approval_workitem_lock_path(pending, item)
+    _ensure_private_dir(path.parent)
+    owner = _approval_workitem_lock_owner(token)
+    now = int(time.time())
+    data = {
+        "owner": owner,
+        "state": "claimed",
+        "createdAt": now,
+    }
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as exc:
+        raise OAConnectorError(
+            "这条审批正在由另一个确认流程处理或刚刚提交，请重新查询待办后再操作"
+        ) from exc
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _mark_approval_workitem_submitted(path: Path, token: str) -> None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        raise OAConnectorError("无法保存审批防重复状态，请勿重复提交") from exc
+    if data.get("owner") != _approval_workitem_lock_owner(token):
+        raise OAConnectorError("审批防重复状态已变化，请勿重复提交")
+    now = int(time.time())
+    data["state"] = "submitted"
+    data["submittedAt"] = now
+    _atomic_write_private_json(path, data, require_exists=True)
+
+
+def _release_approval_workitem_lock(path: Optional[Path], token: str) -> None:
+    if path is None or not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return
+    if data.get("owner") != _approval_workitem_lock_owner(token) or data.get("state") == "submitted":
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _save_batch_progress(
+    token: str,
+    pending: Dict[str, Any],
+    *,
+    status: str,
+    completed_items: list[Dict[str, Any]],
+    current_item: Optional[Dict[str, Any]] = None,
+) -> None:
+    state = dict(pending)
+    state["batchProgress"] = {
+        "status": status,
+        "completedItems": completed_items,
+        "currentItem": current_item,
+        "updatedAt": int(time.time()),
+    }
+    _write_claimed_approval(token, state)
+
+
+def _save_batch_terminal_result(
+    token: str,
+    pending: Dict[str, Any],
+    *,
+    status: str,
+    completed_items: list[Dict[str, Any]],
+    current_item: Optional[Dict[str, Any]],
+    payload: Dict[str, Any],
+    is_error: bool,
+) -> None:
+    now = int(time.time())
+    state = dict(pending)
+    state["batchProgress"] = {
+        "status": status,
+        "completedItems": completed_items,
+        "currentItem": current_item,
+        "updatedAt": now,
+    }
+    state["terminalResult"] = {
+        "isError": is_error,
+        "payload": payload,
+        "completedAt": now,
+    }
+    state["terminalExpiresAt"] = now + BATCH_TERMINAL_RESULT_TTL_SECONDS
+    _write_claimed_approval(token, state)
+
+
+def _load_batch_terminal_result(token: str) -> Optional[Dict[str, Any]]:
+    path = _pending_claim_path(token)
+    if not path.exists():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if _pending_approval_kind(state) != "batch":
+        raise OAConnectorError("这是单条审批确认，请使用 oa_confirm_approval")
+    terminal = state.get("terminalResult")
+    if not isinstance(terminal, dict) or not isinstance(terminal.get("payload"), dict):
+        return None
+    if int(state.get("terminalExpiresAt") or 0) < int(time.time()):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    current_binding = _approval_login_binding(
+        str(state.get("session") or "default"),
+        str(state.get("baseUrl") or ""),
+    )
+    if not state.get("loginBinding") or state["loginBinding"] != current_binding:
+        raise OAConnectorError("OA 登录账号已变化，不能读取上一账号的批量审批结果")
+    if terminal.get("isError"):
+        return _mcp_error(terminal["payload"])
+    return _ok(terminal["payload"])
+
+
+def _cleanup_expired_batch_terminal_results() -> None:
+    pending_dir = _pending_dir()
+    if not pending_dir.exists():
+        return
+    now = int(time.time())
+    for path in pending_dir.glob("*.processing"):
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(state.get("terminalResult"), dict):
+            continue
+        if int(state.get("terminalExpiresAt") or 0) >= now:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _batch_stopped_payload(
+    pending: Dict[str, Any],
+    items: list[Dict[str, Any]],
+    completed_items: list[Dict[str, Any]],
+    current_index: int,
+    reason: str,
+    *,
+    result_unknown: bool,
+    submitted_once: bool,
+) -> Dict[str, Any]:
+    public_reason = _redact_tool_message(reason)
+    current_status = "resultUnknown" if result_unknown else "failed"
+    current_item = _batch_item_with_status(
+        items[current_index],
+        current_index + 1,
+        current_status,
+        reason,
+    )
+    not_attempted_items = [
+        _batch_item_with_status(item, index + 1, "notAttempted")
+        for index, item in enumerate(items[current_index + 1 :], start=current_index + 1)
+    ]
+    completed_count = len(completed_items)
+    completed_prefix = f"前 {completed_count} 条已完成，" if completed_count else ""
+    if result_unknown:
+        user_message = f"批量审批已停止：{completed_prefix}第 {current_index + 1} 条结果不明确，后续未执行。"
+        next_step = "请先在 OA 页面核对当前这条单据的流程状态，不要重复提交；核对后重新查询待办，只为仍需处理的项目准备新批次。"
+    else:
+        user_message = f"批量审批已停止：{completed_prefix}第 {current_index + 1} 条未完成，后续未执行。"
+        next_step = "请处理当前失败原因后重新查询待办，只为仍需处理的项目准备新批次。"
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "batch": True,
+        "anyCompleted": completed_count > 0,
+        "stopped": True,
+        "batchNonTransactional": True,
+        "partialCompletion": completed_count > 0,
+        "totalCount": len(items),
+        "completedCount": completed_count,
+        "completedItems": completed_items,
+        "currentItem": current_item,
+        "notAttemptedCount": len(not_attempted_items),
+        "notAttemptedItems": not_attempted_items,
+        "resultUnknown": result_unknown,
+        "submittedOnce": submitted_once,
+        "retryAllowed": False,
+        "reason": public_reason,
+        "userMessage": user_message,
+        "nextStep": next_step,
+    }
+    if _auth_required_reason(reason):
+        guide = _setup_guide("OA 登录状态不可用", session=str(pending["session"]))
+        payload["reauthRequired"] = True
+        payload["nextAction"] = guide.get("nextAction")
+        payload["nextStep"] = (
+            "请先按 nextAction 重新授权，再重新查询待办；只为仍需处理的项目准备新批次，不能复用本次确认 token。"
+        )
+    return payload
+
+
+def _batch_persistence_stopped_payload(
+    items: list[Dict[str, Any]],
+    completed_items: list[Dict[str, Any]],
+    next_index: int,
+) -> Dict[str, Any]:
+    not_attempted_items = [
+        _batch_item_with_status(item, index + 1, "notAttempted")
+        for index, item in enumerate(items[next_index:], start=next_index)
+    ]
+    all_oa_items_completed = not not_attempted_items and len(completed_items) == len(items)
+    if all_oa_items_completed:
+        user_message = (
+            f"OA 已明确完成全部 {len(completed_items)} 条审批，但本机无法安全保存最终记录。"
+            "请勿重复提交，请先刷新待办核对。"
+        )
+        next_step = "请重新查询 OA 待办并核对全部项目；不要复用本次确认 token。"
+    else:
+        user_message = (
+            f"批量审批已停止：前 {len(completed_items)} 条已完成，但本机无法安全保存后续进度，剩余项目未执行。"
+        )
+        next_step = "请先重新查询 OA 待办并核对已完成项目，再为仍需处理的项目准备新批次；不要复用本次确认 token。"
+    return {
+        "ok": False,
+        "batch": True,
+        "stopped": not all_oa_items_completed,
+        "batchNonTransactional": True,
+        "partialCompletion": bool(completed_items) and bool(not_attempted_items),
+        "anyCompleted": bool(completed_items),
+        "oaCompletedAllItems": all_oa_items_completed,
+        "totalCount": len(items),
+        "completedCount": len(completed_items),
+        "completedItems": completed_items,
+        "currentItem": None,
+        "notAttemptedCount": len(not_attempted_items),
+        "notAttemptedItems": not_attempted_items,
+        "resultUnknown": False,
+        "retryAllowed": False,
+        "statePersistenceWarning": True,
+        "reason": "本机无法安全保存批量审批进度",
+        "userMessage": user_message,
+        "nextStep": next_step,
+    }
 
 
 def _delete_pending_approval(token: str) -> None:
@@ -647,7 +1135,6 @@ TOOLS = [
             "fdId": {"type": "string"},
             "action": {"type": "string", "enum": ["approve", "reject"], "description": "approve=同意，reject=驳回"},
             "note": {"type": "string", "description": "审批备注/意见"},
-            "futureNodeId": {"type": "string", "description": "可选，人工决策下一节点，仅同意时使用"},
             "baseUrl": {"type": "string"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},
             "insecure": {"type": "boolean"},
@@ -660,6 +1147,46 @@ TOOLS = [
         {
             "confirmationToken": {"type": "string"},
             "confirmationText": {"type": "string", "description": "同意填确认审批，驳回填确认驳回"},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+            "insecure": {"type": "boolean"},
+        },
+        ["confirmationToken", "confirmationText"],
+    ),
+    _tool_schema(
+        "oa_prepare_batch_approval",
+        "准备一批审批：一次最多 20 条，可混合同意和驳回，不支持手工指定下一节点。会逐条校验当前账号待办权限、当前节点动作和审批任务绑定；全部通过后才生成确认摘要和 confirmationToken，不提交审批。",
+        {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_BATCH_APPROVAL_ITEMS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "fdId": {"type": "string"},
+                        "action": {
+                            "type": "string",
+                            "enum": ["approve", "reject"],
+                            "description": "approve=同意，reject=驳回",
+                        },
+                        "note": {"type": "string", "description": "本条单据的审批备注/意见"},
+                    },
+                    "required": ["fdId", "action", "note"],
+                    "additionalProperties": False,
+                },
+            },
+            "baseUrl": {"type": "string"},
+            "session": {"type": "string", "description": "本地会话名，默认 default"},
+            "insecure": {"type": "boolean"},
+        },
+        ["items"],
+    ),
+    _tool_schema(
+        "oa_confirm_batch_approval",
+        "用户确认后按摘要顺序逐条执行批量审批。必须传 oa_prepare_batch_approval 返回的 confirmationToken，并传固定确认文本“确认批量审批”。批量审批不是事务；遇到第一条失败或结果不明确会立即停止，后续项目不会执行。",
+        {
+            "confirmationToken": {"type": "string"},
+            "confirmationText": {"type": "string", "description": "固定填写：确认批量审批"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},
             "insecure": {"type": "boolean"},
         },
@@ -863,6 +1390,7 @@ def _http_transport_confirmation_error(session: str, base_url: str, expires_in: 
 
 
 def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    _cleanup_expired_batch_terminal_results()
     session = _session(args)
     insecure = _bool(args, "insecure")
 
@@ -942,100 +1470,344 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "oa_confirm_approval":
         token = str(args["confirmationToken"])
         pending = _load_pending_approval(token)
+        if _pending_approval_kind(pending) != "single":
+            raise OAConnectorError("这是批量审批确认，请使用 oa_confirm_batch_approval")
         expected = _approval_confirm_phrase(str(pending["action"]))
         confirmation_text = str(args["confirmationText"]).strip()
         if confirmation_text != expected:
             raise OAConnectorError(f"确认文本不匹配：需要用户明确发送“{expected}”")
         pending = _claim_pending_approval(token)
+        if _pending_approval_kind(pending) != "single":
+            raise OAConnectorError("这是批量审批确认，请使用 oa_confirm_batch_approval")
         expected = _approval_confirm_phrase(str(pending["action"]))
         if confirmation_text != expected:
             raise OAConnectorError(f"确认文本不匹配：需要用户明确发送“{expected}”")
-        pending_session = str(pending["session"])
-        current_binding = _approval_login_binding(pending_session, str(pending["baseUrl"]))
-        if not pending.get("loginBinding") or pending["loginBinding"] != current_binding:
-            raise OAConnectorError("OA 登录账号已变化，请重新准备审批并再次确认")
-        confirm_client = _client(
-            session=pending_session,
-            base_url=str(pending["baseUrl"]),
-            insecure=bool(pending.get("insecure")),
-        )
-        try:
-            _find_current_todo(confirm_client, str(pending["fdId"]))
-        except Exception as exc:
-            if not (
-                _auth_required_reason(str(exc))
-                and _auto_login_available(pending_session)
-                and _try_auto_login(pending_session)
-            ):
-                raise
-            confirm_client = _client(
-                session=pending_session,
-                base_url=str(pending["baseUrl"]),
-                insecure=bool(pending.get("insecure")),
-            )
-            try:
-                _find_current_todo(confirm_client, str(pending["fdId"]))
-            except Exception as retry_exc:
-                if _auth_required_reason(str(retry_exc)):
-                    _block_auto_login(pending_session)
-                raise
-        current_binding = _approval_login_binding(pending_session, str(pending["baseUrl"]))
-        if not pending.get("loginBinding") or pending["loginBinding"] != current_binding:
-            _delete_pending_approval(token)
-            raise OAConnectorError("OA 登录账号已变化，请重新准备审批并再次确认")
-        approval_binding = pending.get("approvalBinding")
-        if not isinstance(approval_binding, dict) or not all(
-            str(approval_binding.get(key) or "").strip()
-            for key in ("processId", "taskId", "nodeId", "activityType", "operationType")
-        ):
+        if not _approval_binding_complete(pending.get("approvalBinding")):
             _delete_pending_approval(token)
             raise OAConnectorError("审批确认状态不完整，请重新准备审批并再次确认")
+        if pending.get("futureNodeId"):
+            _delete_pending_approval(token)
+            raise OAConnectorError("MCP 正式审批不支持手工指定下一节点，请在 OA 页面处理")
+        workitem_lock: Optional[Path] = None
         try:
-            if pending["action"] == "approve":
-                result = confirm_client.approve(
-                    str(pending["fdId"]),
-                    str(pending["note"]),
-                    execute=True,
-                    future_node_id=pending.get("futureNodeId"),
-                    expected_binding=approval_binding,
-                )
-            else:
-                result = confirm_client.reject(
-                    str(pending["fdId"]),
-                    str(pending["note"]),
-                    execute=True,
-                    expected_binding=approval_binding,
-                )
+            workitem_lock = _acquire_approval_workitem_lock(pending, pending, token)
+            confirm_client = _approval_client_for_pending(pending, str(pending["fdId"]))
+        except Exception:
+            _release_approval_workitem_lock(workitem_lock, token)
+            _delete_pending_approval(token)
+            raise
+        try:
+            result = _execute_bound_approval(confirm_client, pending)
         except ApprovalStateChangedError:
+            _release_approval_workitem_lock(workitem_lock, token)
             _delete_pending_approval(token)
             raise
         except ApprovalResultUnknownError as exc:
+            state_persistence_warning = False
+            try:
+                _mark_approval_workitem_submitted(workitem_lock, token)
+            except Exception:
+                state_persistence_warning = True
             _delete_pending_approval(token)
-            return _mcp_error(
-                {
-                    "ok": False,
-                    "resultUnknown": True,
-                    "submittedOnce": True,
-                    "retryAllowed": False,
-                    "action": pending["action"],
-                    "fdId": pending["fdId"],
-                    "reason": str(exc),
-                    "userMessage": str(exc),
-                    "nextStep": "请用户先打开 OA 页面查看这条单据的流程状态，不要再次提交本次审批。",
-                }
-            )
-        _delete_pending_approval(token)
-        user_message = "已提交审批同意。" if pending["action"] == "approve" else "已提交驳回。"
-        return _ok(
-            {
-                "ok": True,
-                "executed": True,
+            payload = {
+                "ok": False,
+                "resultUnknown": True,
+                "submittedOnce": True,
+                "retryAllowed": False,
                 "action": pending["action"],
                 "fdId": pending["fdId"],
-                "userMessage": user_message,
-                "result": result,
+                "reason": str(exc),
+                "userMessage": str(exc),
+                "nextStep": "请用户先打开 OA 页面查看这条单据的流程状态，不要再次提交本次审批。",
             }
-        )
+            if state_persistence_warning:
+                payload["statePersistenceWarning"] = True
+            return _mcp_error(payload)
+        except OAConnectorError:
+            _release_approval_workitem_lock(workitem_lock, token)
+            _delete_pending_approval(token)
+            raise
+        except Exception as exc:
+            state_persistence_warning = False
+            try:
+                _mark_approval_workitem_submitted(workitem_lock, token)
+            except Exception:
+                state_persistence_warning = True
+            _delete_pending_approval(token)
+            payload = {
+                "ok": False,
+                "resultUnknown": True,
+                "submittedOnce": True,
+                "retryAllowed": False,
+                "action": pending["action"],
+                "fdId": pending["fdId"],
+                "reason": _redact_tool_message(str(exc)),
+                "userMessage": "审批请求可能已经发出，但结果无法确认。请勿重复提交，请先在 OA 页面核对。",
+                "nextStep": "请用户先打开 OA 页面查看这条单据的流程状态，不要再次提交本次审批。",
+            }
+            if state_persistence_warning:
+                payload["statePersistenceWarning"] = True
+            return _mcp_error(payload)
+        state_persistence_warning = False
+        try:
+            _mark_approval_workitem_submitted(workitem_lock, token)
+        except Exception:
+            state_persistence_warning = True
+        _delete_pending_approval(token)
+        user_message = "已提交审批同意。" if pending["action"] == "approve" else "已提交驳回。"
+        payload = {
+            "ok": True,
+            "executed": True,
+            "action": pending["action"],
+            "fdId": pending["fdId"],
+            "userMessage": user_message,
+            "result": result,
+        }
+        if state_persistence_warning:
+            payload["statePersistenceWarning"] = True
+            payload["retryAllowed"] = False
+        return _ok(payload)
+
+    if name == "oa_confirm_batch_approval":
+        token = str(args["confirmationToken"])
+        confirmation_text = str(args["confirmationText"]).strip()
+        terminal_result = _load_batch_terminal_result(token)
+        if terminal_result is not None:
+            if confirmation_text != BATCH_APPROVAL_CONFIRM_PHRASE:
+                raise OAConnectorError(
+                    f"确认文本不匹配：需要用户明确发送“{BATCH_APPROVAL_CONFIRM_PHRASE}”"
+                )
+            return terminal_result
+        pending = _load_pending_approval(token)
+        if _pending_approval_kind(pending) != "batch":
+            raise OAConnectorError("这是单条审批确认，请使用 oa_confirm_approval")
+        if confirmation_text != BATCH_APPROVAL_CONFIRM_PHRASE:
+            raise OAConnectorError(
+                f"确认文本不匹配：需要用户明确发送“{BATCH_APPROVAL_CONFIRM_PHRASE}”"
+            )
+        pending = _claim_pending_approval(token)
+        if _pending_approval_kind(pending) != "batch":
+            raise OAConnectorError("这是单条审批确认，请使用 oa_confirm_approval")
+        if confirmation_text != BATCH_APPROVAL_CONFIRM_PHRASE:
+            raise OAConnectorError(
+                f"确认文本不匹配：需要用户明确发送“{BATCH_APPROVAL_CONFIRM_PHRASE}”"
+            )
+        items = pending.get("items")
+        if not isinstance(items, list) or not items or len(items) > MAX_BATCH_APPROVAL_ITEMS:
+            _delete_pending_approval(token)
+            raise OAConnectorError("批量审批确认状态不完整，请重新准备批量审批")
+        if any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("fdId"), str)
+            or not isinstance(item.get("action"), str)
+            or item.get("action") not in {"approve", "reject"}
+            or not isinstance(item.get("note"), str)
+            or bool(item.get("futureNodeId"))
+            or not _approval_binding_complete(item.get("approvalBinding"))
+            for item in items
+        ):
+            _delete_pending_approval(token)
+            raise OAConnectorError("批量审批确认状态不完整，请重新准备批量审批")
+
+        completed_items: list[Dict[str, Any]] = []
+        for current_index, item in enumerate(items):
+            current_item = _batch_item_with_status(item, current_index + 1, "executing")
+            try:
+                _save_batch_progress(
+                    token,
+                    pending,
+                    status="executing",
+                    completed_items=completed_items,
+                    current_item=current_item,
+                )
+            except Exception as exc:
+                payload = _batch_stopped_payload(
+                    pending,
+                    items,
+                    completed_items,
+                    current_index,
+                    str(exc),
+                    result_unknown=False,
+                    submitted_once=False,
+                )
+                payload["statePersistenceWarning"] = True
+                payload["reason"] = "本机无法安全保存批量审批进度"
+                payload["nextStep"] = "请重新查询 OA 待办后再准备新批次；不要复用本次确认 token。"
+                try:
+                    _save_batch_terminal_result(
+                        token,
+                        pending,
+                        status="failed",
+                        completed_items=completed_items,
+                        current_item=payload["currentItem"],
+                        payload=payload,
+                        is_error=True,
+                    )
+                except Exception:
+                    pass
+                return _mcp_error(payload)
+
+            workitem_lock: Optional[Path] = None
+            try:
+                workitem_lock = _acquire_approval_workitem_lock(pending, item, token)
+                confirm_client = _approval_client_for_pending(pending, str(item["fdId"]))
+            except Exception as exc:
+                _release_approval_workitem_lock(workitem_lock, token)
+                payload = _batch_stopped_payload(
+                    pending,
+                    items,
+                    completed_items,
+                    current_index,
+                    str(exc),
+                    result_unknown=False,
+                    submitted_once=False,
+                )
+                try:
+                    _save_batch_terminal_result(
+                        token,
+                        pending,
+                        status="failed",
+                        completed_items=completed_items,
+                        current_item=payload["currentItem"],
+                        payload=payload,
+                        is_error=True,
+                    )
+                except Exception:
+                    payload["statePersistenceWarning"] = True
+                    payload["retryAllowed"] = False
+                return _mcp_error(payload)
+            try:
+                _execute_bound_approval(confirm_client, item)
+            except ApprovalResultUnknownError as exc:
+                state_persistence_warning = False
+                try:
+                    _mark_approval_workitem_submitted(workitem_lock, token)
+                except Exception:
+                    state_persistence_warning = True
+                payload = _batch_stopped_payload(
+                    pending,
+                    items,
+                    completed_items,
+                    current_index,
+                    str(exc),
+                    result_unknown=True,
+                    submitted_once=True,
+                )
+                if state_persistence_warning:
+                    payload["statePersistenceWarning"] = True
+                try:
+                    _save_batch_terminal_result(
+                        token,
+                        pending,
+                        status="resultUnknown",
+                        completed_items=completed_items,
+                        current_item=payload["currentItem"],
+                        payload=payload,
+                        is_error=True,
+                    )
+                except Exception:
+                    payload["statePersistenceWarning"] = True
+                    payload["retryAllowed"] = False
+                return _mcp_error(payload)
+            except Exception as exc:
+                result_unknown = not isinstance(exc, OAConnectorError)
+                state_persistence_warning = False
+                if result_unknown:
+                    try:
+                        _mark_approval_workitem_submitted(workitem_lock, token)
+                    except Exception:
+                        state_persistence_warning = True
+                else:
+                    _release_approval_workitem_lock(workitem_lock, token)
+                payload = _batch_stopped_payload(
+                    pending,
+                    items,
+                    completed_items,
+                    current_index,
+                    str(exc),
+                    result_unknown=result_unknown,
+                    submitted_once=result_unknown,
+                )
+                if state_persistence_warning:
+                    payload["statePersistenceWarning"] = True
+                try:
+                    _save_batch_terminal_result(
+                        token,
+                        pending,
+                        status="resultUnknown" if result_unknown else "failed",
+                        completed_items=completed_items,
+                        current_item=payload["currentItem"],
+                        payload=payload,
+                        is_error=True,
+                    )
+                except Exception:
+                    payload["statePersistenceWarning"] = True
+                    payload["retryAllowed"] = False
+                return _mcp_error(payload)
+
+            state_persistence_warning = False
+            try:
+                _mark_approval_workitem_submitted(workitem_lock, token)
+            except Exception:
+                state_persistence_warning = True
+            completed_item = _batch_item_with_status(item, current_index + 1, "completed")
+            completed_items.append(completed_item)
+            try:
+                _save_batch_progress(
+                    token,
+                    pending,
+                    status="executing" if current_index + 1 < len(items) else "completed",
+                    completed_items=completed_items,
+                )
+            except Exception:
+                state_persistence_warning = True
+            if state_persistence_warning:
+                payload = _batch_persistence_stopped_payload(
+                    items,
+                    completed_items,
+                    current_index + 1,
+                )
+                try:
+                    _save_batch_terminal_result(
+                        token,
+                        pending,
+                        status="statePersistenceWarning",
+                        completed_items=completed_items,
+                        current_item=None,
+                        payload=payload,
+                        is_error=True,
+                    )
+                except Exception:
+                    pass
+                return _mcp_error(payload)
+
+        payload = {
+            "ok": True,
+            "batch": True,
+            "executed": True,
+            "batchNonTransactional": True,
+            "totalCount": len(items),
+            "completedCount": len(completed_items),
+            "completedItems": completed_items,
+            "currentItem": None,
+            "notAttemptedCount": 0,
+            "notAttemptedItems": [],
+            "userMessage": f"批量审批已完成，共 {len(completed_items)} 条。",
+        }
+        try:
+            _save_batch_terminal_result(
+                token,
+                pending,
+                status="completed",
+                completed_items=completed_items,
+                current_item=None,
+                payload=payload,
+                is_error=False,
+            )
+        except Exception:
+            payload["statePersistenceWarning"] = True
+            payload["retryAllowed"] = False
+        return _ok(payload)
 
     # New search tools: create client with session only, reject bypass params
     if name in _NEW_SEARCH_TOOL_NAMES:
@@ -1131,7 +1903,85 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if name == "oa_get_detail":
         detail = client.get_detail(str(args["fdId"]), require_in_todo=not _bool(args, "allowNonTodo"))
         return _ok(detail)
+    if name == "oa_prepare_batch_approval":
+        requested_items = _normalize_batch_approval_items(args.get("items"))
+        base_url = str(args.get("baseUrl") or client.base_url)
+        login_binding = _approval_login_binding(session, base_url)
+        todo_items = client.list_todos(page=1, page_size=200)
+        todos_by_id = {todo.fd_id: todo.to_dict() for todo in todo_items}
+        prepared_items: list[Dict[str, Any]] = []
+
+        for index, requested in enumerate(requested_items, start=1):
+            todo = todos_by_id.get(requested["fdId"])
+            if todo is None:
+                raise OAConnectorError(f"批量审批第 {index} 条不在当前登录账号的待审批列表中")
+            capability = client.validate_approval_action(
+                requested["fdId"],
+                requested["action"],
+                require_in_todo=False,
+            )
+            approval_binding = capability.get("approvalBinding")
+            if not _approval_binding_complete(approval_binding):
+                raise OAConnectorError(f"批量审批第 {index} 条无法确认当前审批任务，请重新查看待办")
+            raw = todo.get("raw") or {}
+            detail_path = str(todo.get("detailPath") or "")
+            prepared_items.append(
+                {
+                    **requested,
+                    "subject": todo.get("subject") or capability.get("title") or "",
+                    "currentNode": _plain_text(raw.get("nodeName")),
+                    "currentHandler": _plain_text(raw.get("handlerName")),
+                    "detailTitle": capability.get("title", ""),
+                    "detailUrl": _absolute_url(base_url, detail_path) if detail_path else "",
+                    "approvalBinding": approval_binding,
+                }
+            )
+
+        if _approval_login_binding(session, base_url) != login_binding:
+            raise OAConnectorError("OA 登录账号已变化，请重新准备批量审批")
+
+        pending = {
+            "kind": "batch",
+            "session": session,
+            "baseUrl": base_url,
+            "insecure": insecure,
+            "loginBinding": login_binding,
+            "items": prepared_items,
+        }
+        token = _save_pending_approval(pending)
+        public_items = [
+            _batch_item_public(item, index)
+            for index, item in enumerate(prepared_items, start=1)
+        ]
+        approve_count = sum(item["action"] == "approve" for item in prepared_items)
+        reject_count = len(prepared_items) - approve_count
+        return _ok(
+            {
+                "ok": True,
+                "batch": True,
+                "requiresUserConfirmation": True,
+                "confirmationToken": token,
+                "confirmationPhrase": BATCH_APPROVAL_CONFIRM_PHRASE,
+                "summary": {
+                    "totalCount": len(public_items),
+                    "approveCount": approve_count,
+                    "rejectCount": reject_count,
+                    "items": public_items,
+                },
+                "permissionCheck": {
+                    "ok": True,
+                    "checkedCount": len(public_items),
+                    "actionAvailable": True,
+                    "evidence": "全部单据都属于当前登录账号的 OA 待审批清单，且详情页确认当前节点支持所选动作。执行每一条前还会再次校验。",
+                },
+                "batchNonTransactional": True,
+                "warning": "批量审批会按清单顺序逐条提交，不是一次性事务；如果中途失败，前面已完成的项目不会回滚，后续项目不会执行。",
+                "nextStep": f"请把 summary 和 warning 整理给用户确认。用户明确回复“{BATCH_APPROVAL_CONFIRM_PHRASE}”后，调用 oa_confirm_batch_approval。",
+            }
+        )
     if name == "oa_prepare_approval":
+        if "futureNodeId" in args:
+            raise OAConnectorError("MCP 正式审批不支持手工指定下一节点，请在 OA 页面处理")
         fd_id = str(args["fdId"])
         action = str(args["action"])
         note = str(args["note"]).strip()
@@ -1141,18 +1991,18 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         todo = _find_current_todo(client, fd_id)
         capability = client.validate_approval_action(fd_id, action, require_in_todo=False)
         approval_binding = capability.get("approvalBinding")
-        if not isinstance(approval_binding, dict):
+        if not _approval_binding_complete(approval_binding):
             raise OAConnectorError("无法确认当前审批任务，请重新查看这条待办")
         raw = todo.get("raw") or {}
         base_url = str(args.get("baseUrl") or client.base_url)
         pending = {
+            "kind": "single",
             "session": session,
             "baseUrl": base_url,
             "insecure": insecure,
             "fdId": fd_id,
             "action": action,
             "note": note,
-            "futureNodeId": args.get("futureNodeId"),
             "loginBinding": _approval_login_binding(session, base_url),
             "approvalBinding": approval_binding,
         }
@@ -1171,6 +2021,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 "currentNode": _plain_text(raw.get("nodeName")),
                 "currentHandler": _plain_text(raw.get("handlerName")),
                 "detailTitle": capability.get("title", ""),
+                "detailUrl": _absolute_url(base_url, str(todo.get("detailPath") or "")),
             },
             "permissionCheck": {
                 "ok": True,
