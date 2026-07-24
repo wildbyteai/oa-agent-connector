@@ -20,10 +20,11 @@ from .security import sanitize_error_message
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.11"
+SERVER_VERSION = "0.2.12"
 MAX_BATCH_APPROVAL_ITEMS = 20
 BATCH_APPROVAL_CONFIRM_PHRASE = "确认批量审批"
 BATCH_TERMINAL_RESULT_TTL_SECONDS = 3600
+APPROVAL_SCOPE_VERSION = "standard-approval-v1"
 
 
 def _state_dir() -> Path:
@@ -347,6 +348,56 @@ def _auth_required_reason(reason: str) -> bool:
     )
 
 
+def _approval_handling(code: str) -> Dict[str, Any]:
+    levels = {
+        "standard_approval": {
+            "scopeVersion": APPROVAL_SCOPE_VERSION,
+            "level": 1,
+            "code": "standard_approval",
+            "label": "可在对话中审批",
+            "canContinueInChat": True,
+            "message": (
+                "当前版本只会提交同意或驳回和审批意见，不会填写或修改业务表单，也不会选择下一流向。"
+                "只有确认这条单据不需要这些操作时，才可继续确认。"
+            ),
+        },
+        "detail_check_required": {
+            "scopeVersion": APPROVAL_SCOPE_VERSION,
+            "level": 2,
+            "code": "detail_check_required",
+            "label": "需要先核对",
+            "canContinueInChat": False,
+            "message": (
+                "请先查看详情，确认是否需要填写或修改业务表单、选择下一流向，或执行转办、沟通、废弃、加签、补签等特殊操作。"
+                "未确认前不要准备审批。"
+            ),
+        },
+        "native_oa_required": {
+            "scopeVersion": APPROVAL_SCOPE_VERSION,
+            "level": 3,
+            "code": "native_oa_required",
+            "label": "请到 OA 处理",
+            "canContinueInChat": False,
+            "message": "这类操作超出当前版本范围，请打开 OA 详情页处理。连接器不会代填表单或选择流程。",
+        },
+    }
+    try:
+        return dict(levels[code])
+    except KeyError as exc:
+        raise ValueError(f"unknown approval handling code: {code}") from exc
+
+
+def _native_oa_required_reason(reason: str) -> bool:
+    text = str(reason or "")
+    return any(
+        marker in text
+        for marker in (
+            "不支持手工指定下一节点",
+            "请在 OA 页面处理",
+        )
+    )
+
+
 def _setup_guide(reason: str = "", session: str = "default") -> Dict[str, Any]:
     example_base_url = os.getenv("OA_BASE_URL") or _saved_base_url(session) or "<OA_BASE_URL>"
     example_state_dir = os.getenv("OA_AGENT_STATE_DIR") or str(_state_dir())
@@ -407,7 +458,17 @@ def _redact_tool_message(message: str) -> str:
 
 
 def _tool_error(message: str, session: str = "default") -> Dict[str, Any]:
-    return _mcp_error(_setup_guide(_redact_tool_message(message), session=session))
+    public_message = _redact_tool_message(message)
+    if _native_oa_required_reason(message):
+        return _mcp_error(
+            {
+                "ok": False,
+                "reason": public_message,
+                "approvalHandling": _approval_handling("native_oa_required"),
+                "nextStep": "请使用详情链接打开 OA 原生页面完成这条审批。",
+            }
+        )
+    return _mcp_error(_setup_guide(public_message, session=session))
 
 
 def _plain_text(value: Any) -> str:
@@ -1107,7 +1168,7 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_list_todos",
-        "查询当前登录账号有权限看到的待审批清单。",
+        "查询当前登录账号有权限看到的待审批清单。返回 approvalHandling=需要先核对；审批前必须先查看详情，不能仅凭标题直接准备审批。",
         {
             "baseUrl": {"type": "string"},
             "session": {"type": "string", "description": "本地会话名，默认 default"},
@@ -1118,7 +1179,7 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_get_detail",
-        "查看待审批单据详情。默认要求 fdId 必须在当前登录账号待办清单中。",
+        "查看待审批单据详情。默认要求 fdId 必须在当前登录账号待办清单中。返回 approvalHandling=需要先核对；如需填写表单、选择流向或特殊动作，必须打开 OA 页面处理。",
         {
             "fdId": {"type": "string"},
             "baseUrl": {"type": "string"},
@@ -1130,7 +1191,7 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_prepare_approval",
-        "准备审批动作：校验当前账号待办权限和当前节点可用动作，整理单据、动作和备注，生成待用户确认的摘要和 confirmationToken。不提交审批。",
+        "仅准备标准审批：校验当前账号待办权限和当前节点可用动作，整理单据、同意或驳回和备注，生成待用户确认的摘要和 confirmationToken。不填写业务表单、不选择下一流向，也不提交审批。",
         {
             "fdId": {"type": "string"},
             "action": {"type": "string", "enum": ["approve", "reject"], "description": "approve=同意，reject=驳回"},
@@ -1154,7 +1215,7 @@ TOOLS = [
     ),
     _tool_schema(
         "oa_prepare_batch_approval",
-        "准备一批审批：一次最多 20 条，可混合同意和驳回，不支持手工指定下一节点。会逐条校验当前账号待办权限、当前节点动作和审批任务绑定；全部通过后才生成确认摘要和 confirmationToken，不提交审批。",
+        "准备一批标准审批：一次最多 20 条，可混合同意和驳回。每条都必须已确认不需要填写表单、选择流向或特殊动作。会逐条校验当前账号待办权限、当前节点动作和审批任务绑定；全部通过后才生成确认摘要和 confirmationToken，不提交审批。",
         {
             "items": {
                 "type": "array",
@@ -1899,9 +1960,18 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             if data.get("detailPath"):
                 data["detailUrl"] = _absolute_url(client.base_url, str(data["detailPath"]))
             todos.append(data)
-        return _ok({"items": todos, "page": page, "pageSize": page_size, "session": session})
+        return _ok(
+            {
+                "items": todos,
+                "page": page,
+                "pageSize": page_size,
+                "session": session,
+                "approvalHandling": _approval_handling("detail_check_required"),
+            }
+        )
     if name == "oa_get_detail":
         detail = client.get_detail(str(args["fdId"]), require_in_todo=not _bool(args, "allowNonTodo"))
+        detail["approvalHandling"] = _approval_handling("detail_check_required")
         return _ok(detail)
     if name == "oa_prepare_batch_approval":
         requested_items = _normalize_batch_approval_items(args.get("items"))
@@ -1974,6 +2044,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                     "actionAvailable": True,
                     "evidence": "全部单据都属于当前登录账号的 OA 待审批清单，且详情页确认当前节点支持所选动作。执行每一条前还会再次校验。",
                 },
+                "approvalHandling": _approval_handling("standard_approval"),
                 "batchNonTransactional": True,
                 "warning": "批量审批会按清单顺序逐条提交，不是一次性事务；如果中途失败，前面已完成的项目不会回滚，后续项目不会执行。",
                 "nextStep": f"请把 summary 和 warning 整理给用户确认。用户明确回复“{BATCH_APPROVAL_CONFIRM_PHRASE}”后，调用 oa_confirm_batch_approval。",
@@ -2028,6 +2099,7 @@ def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 "actionAvailable": True,
                 "evidence": "该单据属于当前登录账号的 OA 待审批清单，且详情页确认当前节点支持本次审批动作；执行前会再次校验。",
             },
+            "approvalHandling": _approval_handling("standard_approval"),
             "nextStep": f"请把 summary 整理给用户确认。用户明确回复“{_approval_confirm_phrase(action)}”后，调用 oa_confirm_approval。",
         }
         return _ok(summary)

@@ -242,6 +242,10 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 - MCP 正式审批必须走 `oa_prepare_approval` -> 用户确认 -> `oa_confirm_approval`。
 - MCP 批量审批必须走 `oa_prepare_batch_approval` -> 用户确认 -> `oa_confirm_batch_approval`，固定确认词为 `确认批量审批`。
 - `oa_prepare_approval` 会先确认 `fdId` 在当前登录账号待办清单中，并从详情页确认用户选择的同意或驳回动作确实可用，再整理单据、动作、备注、当前节点、当前处理人。
+- 当前稳定审批范围是 `standard-approval-v1`：只提交同意或驳回和审批意见，不填写或修改业务表单，不选择下一流向，也不执行转办、沟通、废弃、加签、补签等特殊动作。
+- `oa_list_todos` 和 `oa_get_detail` 返回 `approvalHandling.level=2`，表示“需要先核对”；不能仅凭待办标题直接准备审批。
+- `oa_prepare_approval` 和 `oa_prepare_batch_approval` 返回 `approvalHandling.level=1`，表示本次使用标准审批通道。Agent 必须在确认摘要中说明“不会填写表单或选择流向”。
+- 需要填写表单、选择流向或执行特殊动作时，按 `approvalHandling.level=3` 输出“请到 OA 处理”，并提供 `detailUrl`。
 - `oa_confirm_approval` 执行前会再次查询当前登录账号待办清单，`fdId` 不在清单中则拒绝。
 - `oa_prepare_batch_approval` 单次最多接受 20 条，可混合同意和驳回；所有项目都通过待办权限、动作和 workitem 绑定校验后才生成一个批量确认 token。
 - MCP 正式审批工具不接受 `futureNodeId`。需要人工选择下一节点时，必须让用户在 OA 原生页面处理。
@@ -261,10 +265,11 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 用户选择一条待办后，推荐 agent 行为如下：
 
 1. 调用 `oa_get_detail` 查看详情。
-2. 和用户确认想做的动作：同意或驳回。
-3. 向用户确认审批备注/意见。
-4. 调用 `oa_prepare_approval`，只准备不提交。
-5. 把返回的 `summary` 整理给用户确认，至少包含：
+2. 读取 `approvalHandling`，并核对详情页是否要求填写或修改业务表单、选择下一流向，或者执行标准同意/驳回之外的动作。
+3. 如果属于复杂审批，输出“请到 OA 处理”和详情链接，不调用准备或确认工具。
+4. 只有确认属于标准审批后，才和用户确认想做的动作：同意或驳回，以及审批备注/意见。
+5. 调用 `oa_prepare_approval`，只准备不提交。
+6. 把返回的 `summary` 和 `approvalHandling` 整理给用户确认，至少包含：
    - 单据 `fdId`
    - 主题
    - 当前节点
@@ -272,7 +277,8 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
    - 动作：同意/驳回
    - 审批备注
    - 权限校验结果
-6. 用户明确回复 `确认审批` 或 `确认驳回` 后，调用 `oa_confirm_approval`。
+   - 本次只提交同意或驳回和审批意见，不填写表单，也不选择下一流向
+7. 用户明确回复 `确认审批` 或 `确认驳回` 后，调用 `oa_confirm_approval`。
 
 准备同意审批：
 
@@ -315,7 +321,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 ### 批量审批
 
-用户一次选择多条待办时，Agent 应先把每条单据的动作和备注确认清楚，再调用 `oa_prepare_batch_approval`。示例：
+用户一次选择多条待办时，Agent 必须先逐条查看详情。只有每条都确认属于标准审批，才能把动作和备注整理后调用 `oa_prepare_batch_approval`。任何一条需要填写表单、选择流向或执行特殊动作，都应从批次中移除并提示用户到 OA 页面处理。示例：
 
 ```json
 {

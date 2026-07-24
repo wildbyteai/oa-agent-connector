@@ -741,6 +741,7 @@ class MCPServerTest(unittest.TestCase):
     def test_initialize_and_tools_list(self):
         init = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "oa-agent-connector")
+        self.assertEqual(init["result"]["serverInfo"]["version"], "0.2.12")
 
         with patch.dict("os.environ", {"OA_AGENT_ENABLE_PASSWORD_LOGIN": ""}, clear=False):
             tools = mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
@@ -827,6 +828,42 @@ class MCPServerTest(unittest.TestCase):
                     payload = json.loads(text)
                     self.assertEqual(payload["items"][0]["subject"], "采购审批")
                     self.assertEqual(payload["items"][0]["detailUrl"], "https://example.invalid/oa/km/review/km_review_main/kmReviewMain.do?method=view&fdId=1234567890abcdef1234567890abcdef")
+                    self.assertEqual(
+                        payload["approvalHandling"],
+                        {
+                            "scopeVersion": "standard-approval-v1",
+                            "level": 2,
+                            "code": "detail_check_required",
+                            "label": "需要先核对",
+                            "canContinueInChat": False,
+                            "message": "请先查看详情，确认是否需要填写或修改业务表单、选择下一流向，或执行转办、沟通、废弃、加签、补签等特殊操作。未确认前不要准备审批。",
+                        },
+                    )
+
+    def test_get_detail_marks_approval_as_needing_review(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {"OA_AGENT_STATE_DIR": tmpdir, "OA_BASE_URL": "https://example.invalid/oa/"},
+                clear=False,
+            ):
+                with patch.object(mcp_server, "OAClient", FakeClient):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "oa_get_detail",
+                                "arguments": {"fdId": "1234567890abcdef1234567890abcdef"},
+                            },
+                        }
+                    )
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["approvalHandling"]["level"], 2)
+        self.assertEqual(payload["approvalHandling"]["code"], "detail_check_required")
+        self.assertFalse(payload["approvalHandling"]["canContinueInChat"])
 
     def test_password_login_hidden_and_disabled_by_default(self):
         with patch.dict("os.environ", {"OA_AGENT_ENABLE_PASSWORD_LOGIN": ""}, clear=False):
@@ -1207,6 +1244,11 @@ class MCPServerTest(unittest.TestCase):
                     self.assertTrue(payload["requiresUserConfirmation"])
                     self.assertEqual(payload["confirmationPhrase"], "确认审批")
                     self.assertTrue(payload["permissionCheck"]["actionAvailable"])
+                    self.assertEqual(payload["approvalHandling"]["scopeVersion"], "standard-approval-v1")
+                    self.assertEqual(payload["approvalHandling"]["level"], 1)
+                    self.assertEqual(payload["approvalHandling"]["code"], "standard_approval")
+                    self.assertTrue(payload["approvalHandling"]["canContinueInChat"])
+                    self.assertIn("不会填写或修改业务表单", payload["approvalHandling"]["message"])
 
                     confirmed = mcp_server.handle(
                         {
@@ -1355,7 +1397,12 @@ class BatchApprovalMCPServerTest(unittest.TestCase):
                 pending_files = list(pending_dir.glob("*.json")) if pending_dir.exists() else []
 
         self.assertTrue(response["result"]["isError"])
-        self.assertIn("不支持手工指定下一节点", self._payload(response)["reason"])
+        payload = self._payload(response)
+        self.assertIn("不支持手工指定下一节点", payload["reason"])
+        self.assertEqual(payload["approvalHandling"]["level"], 3)
+        self.assertEqual(payload["approvalHandling"]["code"], "native_oa_required")
+        self.assertFalse(payload["approvalHandling"]["canContinueInChat"])
+        self.assertNotIn("guide", payload)
         self.assertEqual(pending_files, [])
 
     def test_single_confirm_rejects_legacy_token_with_future_node(self):
@@ -1533,6 +1580,9 @@ class BatchApprovalMCPServerTest(unittest.TestCase):
                     self.assertEqual(calls["list"], 1)
                     self.assertEqual(prepared_payload["confirmationPhrase"], "确认批量审批")
                     self.assertTrue(prepared_payload["batchNonTransactional"])
+                    self.assertEqual(prepared_payload["approvalHandling"]["level"], 1)
+                    self.assertEqual(prepared_payload["approvalHandling"]["code"], "standard_approval")
+                    self.assertTrue(prepared_payload["approvalHandling"]["canContinueInChat"])
                     confirmed = self._tool_call(
                         "oa_confirm_batch_approval",
                         {
