@@ -741,11 +741,12 @@ class MCPServerTest(unittest.TestCase):
     def test_initialize_and_tools_list(self):
         init = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "oa-agent-connector")
-        self.assertEqual(init["result"]["serverInfo"]["version"], "0.2.12")
+        self.assertEqual(init["result"]["serverInfo"]["version"], "0.2.13")
 
         with patch.dict("os.environ", {"OA_AGENT_ENABLE_PASSWORD_LOGIN": ""}, clear=False):
             tools = mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         names = {tool["name"] for tool in tools["result"]["tools"]}
+        self.assertIn("oa_version_status", names)
         self.assertIn("oa_setup_guide", names)
         self.assertIn("oa_begin_auth", names)
         self.assertIn("oa_local_auth_status", names)
@@ -839,6 +840,361 @@ class MCPServerTest(unittest.TestCase):
                             "message": "请先查看详情，确认是否需要填写或修改业务表单、选择下一流向，或执行转办、沟通、废弃、加签、补签等特殊操作。未确认前不要准备审批。",
                         },
                     )
+                    self.assertEqual(
+                        payload["versionCheck"],
+                        {
+                            "recommended": True,
+                            "tool": "oa_version_status",
+                            "arguments": {},
+                            "message": "本次操作完成后检查一次 OA 助手版本。检查结果会在本机缓存；只有发现新版本时才提示用户。",
+                        },
+                    )
+
+    def test_version_status_reports_update_and_uses_success_cache(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, limit):
+                self.limit = limit
+                return b'[project]\nname = "oa-agent-connector"\nversion = "0.2.14"\n'
+
+        response = FakeResponse()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                with patch("oa_agent_connector.mcp_server.urllib.request.urlopen", return_value=response) as opened:
+                    first = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "oa_version_status", "arguments": {}},
+                        }
+                    )
+                    second = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {"name": "oa_version_status", "arguments": {}},
+                        }
+                    )
+
+        first_payload = json.loads(first["result"]["content"][0]["text"])
+        second_payload = json.loads(second["result"]["content"][0]["text"])
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(first_payload["installedVersion"], "0.2.13")
+        self.assertEqual(first_payload["latestVersion"], "0.2.14")
+        self.assertTrue(first_payload["updateAvailable"])
+        self.assertEqual(first_payload["status"], "update_available")
+        self.assertTrue(first_payload["agentAction"]["notifyUser"])
+        self.assertTrue(first_payload["agentAction"]["requiresUserConfirmation"])
+        self.assertNotIn("versionCheck", first_payload)
+        self.assertTrue(second_payload["cached"])
+
+    def test_version_status_failure_is_non_blocking_and_redacted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                with patch(
+                    "oa_agent_connector.mcp_server.urllib.request.urlopen",
+                    side_effect=OSError("Authorization: Bearer should-not-leak"),
+                ):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "oa_version_status", "arguments": {"force": True}},
+                        }
+                    )
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "unknown")
+        self.assertIsNone(payload["updateAvailable"])
+        self.assertFalse(payload["agentAction"]["notifyUser"])
+        self.assertNotIn("should-not-leak", json.dumps(payload, ensure_ascii=False))
+
+    def test_version_status_failure_uses_failure_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    side_effect=OSError("offline"),
+                ) as fetch:
+                    first = mcp_server._version_status()
+                    second = mcp_server._version_status()
+
+        self.assertEqual(fetch.call_count, 1)
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["status"], "unknown")
+        self.assertFalse(second["agentAction"]["notifyUser"])
+
+    def test_version_status_force_bypasses_success_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                mcp_server._write_version_check_cache(
+                    {
+                        "status": "success",
+                        "checkedAt": int(time.time()),
+                        "latestVersion": "0.2.14",
+                    }
+                )
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    return_value="0.2.15",
+                ) as fetch:
+                    cached = mcp_server._version_status()
+                    forced = mcp_server._version_status(force=True)
+
+        self.assertEqual(fetch.call_count, 1)
+        self.assertTrue(cached["cached"])
+        self.assertEqual(cached["latestVersion"], "0.2.14")
+        self.assertFalse(forced["cached"])
+        self.assertEqual(forced["latestVersion"], "0.2.15")
+
+    def test_version_status_refreshes_expired_success_and_failure_cache(self):
+        now = int(time.time())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                mcp_server._write_version_check_cache(
+                    {
+                        "status": "success",
+                        "checkedAt": now - mcp_server.VERSION_CHECK_SUCCESS_TTL_SECONDS,
+                        "latestVersion": "0.2.14",
+                    }
+                )
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    return_value="0.2.13",
+                ) as success_fetch:
+                    success_result = mcp_server._version_status()
+
+                mcp_server._write_version_check_cache(
+                    {
+                        "status": "failure",
+                        "checkedAt": now - mcp_server.VERSION_CHECK_FAILURE_TTL_SECONDS,
+                    }
+                )
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    return_value="0.2.13",
+                ) as failure_fetch:
+                    failure_result = mcp_server._version_status()
+
+        success_fetch.assert_called_once_with()
+        failure_fetch.assert_called_once_with()
+        self.assertFalse(success_result["cached"])
+        self.assertFalse(failure_result["cached"])
+
+    def test_version_status_ignores_corrupt_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                cache_path = mcp_server._version_check_cache_path()
+                cache_path.write_text("{not-json", encoding="utf-8")
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    return_value="0.2.13",
+                ) as fetch:
+                    result = mcp_server._version_status()
+
+        fetch.assert_called_once_with()
+        self.assertEqual(result["status"], "current")
+
+    def test_version_status_concurrent_calls_share_one_fetch(self):
+        fetch_started = threading.Event()
+        release_fetch = threading.Event()
+        fetch_count = 0
+        fetch_count_lock = threading.Lock()
+        results = []
+
+        def fetch():
+            nonlocal fetch_count
+            with fetch_count_lock:
+                fetch_count += 1
+            fetch_started.set()
+            release_fetch.wait(2)
+            return "0.2.14"
+
+        def check_version():
+            results.append(mcp_server._version_status())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    side_effect=fetch,
+                ):
+                    first = threading.Thread(target=check_version)
+                    second = threading.Thread(target=check_version)
+                    first.start()
+                    self.assertTrue(fetch_started.wait(1))
+                    second.start()
+                    time.sleep(0.1)
+                    release_fetch.set()
+                    first.join(2)
+                    second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(fetch_count, 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sorted(result["cached"] for result in results), [False, True])
+
+    def test_version_status_does_not_notify_when_public_version_is_older(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    return_value="0.2.12",
+                ):
+                    result = mcp_server._version_status()
+
+        self.assertEqual(result["status"], "ahead")
+        self.assertFalse(result["updateAvailable"])
+        self.assertFalse(result["agentAction"]["notifyUser"])
+
+    def test_version_status_current_version_does_not_notify_user(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "",
+                },
+                clear=False,
+            ):
+                with patch(
+                    "oa_agent_connector.mcp_server._fetch_latest_version",
+                    return_value="0.2.13",
+                ):
+                    response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "oa_version_status", "arguments": {}},
+                        }
+                    )
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["status"], "current")
+        self.assertFalse(payload["updateAvailable"])
+        self.assertFalse(payload["agentAction"]["notifyUser"])
+        self.assertNotIn("versionCheck", payload)
+
+    def test_version_check_can_be_disabled_without_network_or_recommendation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "OA_AGENT_STATE_DIR": tmpdir,
+                    "OA_AGENT_DISABLE_UPDATE_CHECK": "1",
+                },
+                clear=False,
+            ):
+                with patch("oa_agent_connector.mcp_server._fetch_latest_version") as fetch:
+                    version_response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {"name": "oa_version_status", "arguments": {}},
+                        }
+                    )
+                    guide_response = mcp_server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {"name": "oa_setup_guide", "arguments": {}},
+                        }
+                    )
+
+        version_payload = json.loads(version_response["result"]["content"][0]["text"])
+        guide_payload = json.loads(guide_response["result"]["content"][0]["text"])
+        fetch.assert_not_called()
+        self.assertEqual(version_payload["status"], "disabled")
+        self.assertFalse(version_payload["agentAction"]["notifyUser"])
+        self.assertNotIn("versionCheck", guide_payload)
+
+    def test_version_status_rejects_oa_connection_parameters(self):
+        response = mcp_server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "oa_version_status",
+                    "arguments": {"baseUrl": "https://example.invalid/oa/"},
+                },
+            }
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertIn("不接受参数", payload["reason"])
+        self.assertNotIn("versionCheck", payload)
 
     def test_get_detail_marks_approval_as_needing_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -912,6 +1268,7 @@ class MCPServerTest(unittest.TestCase):
                 self.assertTrue(payload["configurationRequired"])
                 self.assertFalse(payload["reauthRequired"])
                 self.assertIsNone(payload["nextAction"])
+                self.assertEqual(payload["versionCheck"]["tool"], "oa_version_status")
 
     def test_auth_error_does_not_delete_cookie_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:

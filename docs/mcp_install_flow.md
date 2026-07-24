@@ -1,5 +1,7 @@
 # OA MCP 安装与授权流程
 
+当前稳定版本为 `0.2.13`，审批能力范围为 `standard-approval-v1`。
+
 目标流程：
 
 1. 新用户下载安装 MCP。
@@ -7,6 +9,7 @@
 3. Agent 调用 `oa_begin_auth` 生成本机授权链接，用户点击后在本机页面完成 OA 授权。
 4. 调用 `oa_list_todos` 查询当前登录账号有权限看到的待审批清单。
 5. 需要搜索 OA 文档时，调用只读搜索、详情和附件下载工具，仍然只基于当前登录账号权限。
+6. 每次 OA 业务操作后按结果中的 `versionCheck` 调用 `oa_version_status`；只有发现新版本时才询问用户是否升级。
 
 对普通用户的标准回复话术见 [oa_mcp_user_output_standard.md](oa_mcp_user_output_standard.md)。Agent 面向用户输出时应使用自然语言，不直接展示 MCP 参数、JSON、token、fdId、HTTP 错误等技术内容。
 
@@ -195,6 +198,23 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 }
 ```
 
+## 每次操作后的版本检查
+
+OA 业务工具的成功和错误结果都会附带内部 `versionCheck` 提示。Agent 应先完成当前业务回复，再调用 `oa_version_status`，参数使用空对象即可：
+
+```json
+{}
+```
+
+普通调用不传 `force`，让连接器使用本机缓存：成功检查缓存 24 小时，失败检查缓存 1 小时。
+
+- `updateAvailable=false`：不向用户输出版本信息。
+- `updateAvailable=null`：表示暂时无法检查，不影响当前 OA 操作，也不展示原始错误。
+- `updateAvailable=true`：向用户说明当前版本和新版本，并询问是否升级；没有用户确认时不能自动升级。
+- 升级完成后刷新或重启 MCP 工具，确保旧进程退出。
+
+版本检查只访问公开 GitHub 版本文件，不携带 OA 地址、账号、Cookie 或业务数据。可设置 `OA_AGENT_DISABLE_UPDATE_CHECK=1` 完全关闭此检查。
+
 ## 用户直接说“在 OA 里搜索”
 
 推荐 agent 行为：
@@ -364,6 +384,7 @@ GET /km/review/km_review_index/kmReviewIndex.do?method=list&j_path=/listApproval
 
 ## 可用工具
 
+- `oa_version_status`：检查公开版本；默认使用本机缓存，只有发现新版本时才建议升级。
 - `oa_setup_guide`：返回配置、授权、查询的分步引导。
 - `oa_begin_auth`：启动本机授权页面，返回可点击授权链接。
 - `oa_local_auth_status`：查询本机授权页面状态。

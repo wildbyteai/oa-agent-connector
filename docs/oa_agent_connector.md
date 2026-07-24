@@ -12,7 +12,7 @@
 
 ## 当前版本范围
 
-`0.2.12` 将审批能力固定为 `standard-approval-v1`：支持审批意见、同意、驳回，以及相同范围内的批量审批；不填写或修改业务表单，不选择下一流向，也不执行转办、沟通、废弃、加签、补签等特殊动作。
+`0.2.13` 将审批能力固定为 `standard-approval-v1`：支持审批意见、同意、驳回，以及相同范围内的批量审批；不填写或修改业务表单，不选择下一流向，也不执行转办、沟通、废弃、加签、补签等特殊动作。
 
 MCP 返回统一的 `approvalHandling`：
 
@@ -72,10 +72,22 @@ MCP 普通授权默认使用 `oa_begin_auth` 本机授权页。`oa_login` 默认
 
 用户在本机授权页勾选“在这台电脑上安全记住”后，密码通过 `keyring` 保存到 macOS 钥匙串或 Windows 凭据管理器。Keyring 服务标识同时绑定 `OA_AGENT_STATE_DIR` 和 session，避免同一电脑上的多套连接器互相覆盖。MCP 检测到明确的登录失效时，会自动登录并把只读操作重试一次；审批确认只在执行前的待办权限复核阶段自动恢复，不会自动重放审批提交。失败后默认冷却 15 分钟，连续失败 3 次后停止自动登录并要求重新授权。`oa_disable_auto_login` 可删除系统凭据并保留当前 Cookie。
 
+## 版本识别
+
+MCP 工具 `oa_version_status` 会读取公开 GitHub 仓库 `main` 分支的 `pyproject.toml`，与本机 `SERVER_VERSION` 比较。业务工具响应会附带 `versionCheck`，建议 Agent 在业务回复后调用该工具。
+
+- 成功结果缓存 24 小时，失败结果缓存 1 小时，缓存文件为 `OA_AGENT_STATE_DIR/version-check.json`。
+- 只有远端版本更高时返回 `updateAvailable=true` 和需要用户确认的升级提示。
+- 检查失败返回非阻断结果，不泄露底层异常，也不影响 OA 业务工具。
+- 版本工具不接受 OA 地址、账号、Cookie 等连接参数。
+- 设置 `OA_AGENT_DISABLE_UPDATE_CHECK=1` 可关闭版本检查。
+- 连接器不自动升级；用户确认后由 Agent 执行安装，并刷新或重启 MCP 进程。
+
 ## Agent 工具封装建议
 
 对外暴露工具时建议只暴露以下动作：
 
+- `version_status(force=False)`：检查公开版本，默认使用本机缓存
 - `begin_auth(base_url)`：默认授权入口，返回本机授权链接
 - `local_auth_status(auth_token)`
 - `disable_auto_login()`：删除系统密码保险箱中的登录信息，保留当前 Cookie

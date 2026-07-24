@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import hashlib
-import re
+import http.client
 import json
 import os
 import posixpath
+import re
 import secrets
 import sys
 import time
 import urllib.parse
+import urllib.request
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -20,11 +22,18 @@ from .security import sanitize_error_message
 
 
 SERVER_NAME = "oa-agent-connector"
-SERVER_VERSION = "0.2.12"
+SERVER_VERSION = "0.2.13"
 MAX_BATCH_APPROVAL_ITEMS = 20
 BATCH_APPROVAL_CONFIRM_PHRASE = "确认批量审批"
 BATCH_TERMINAL_RESULT_TTL_SECONDS = 3600
 APPROVAL_SCOPE_VERSION = "standard-approval-v1"
+VERSION_CHECK_SOURCE_URL = "https://raw.githubusercontent.com/wildbyteai/oa-agent-connector/main/pyproject.toml"
+VERSION_CHECK_REPOSITORY_URL = "https://github.com/wildbyteai/oa-agent-connector.git"
+VERSION_CHECK_SUCCESS_TTL_SECONDS = 86400
+VERSION_CHECK_FAILURE_TTL_SECONDS = 3600
+VERSION_CHECK_MAX_BYTES = 65536
+VERSION_CHECK_LOCK_WAIT_SECONDS = 4.0
+VERSION_CHECK_LOCK_STALE_SECONDS = 15
 
 
 def _state_dir() -> Path:
@@ -111,6 +120,14 @@ def _transport_confirmation_path(token: str) -> Path:
 
 def _auto_login_lock_path(session: str) -> Path:
     return _state_dir() / "auto-login-locks" / f"{_safe_session_name(session)}.lock"
+
+
+def _version_check_cache_path() -> Path:
+    return _state_dir() / "version-check.json"
+
+
+def _version_check_lock_path() -> Path:
+    return _state_dir() / "version-check.lock"
 
 
 def _write_session_meta(session: str, data: Dict[str, Any]) -> None:
@@ -280,6 +297,7 @@ def _try_auto_login(session: str) -> bool:
 
 def _can_retry_after_auto_login(tool_name: str) -> bool:
     return tool_name not in {
+        "oa_version_status",
         "oa_setup_guide",
         "oa_begin_auth",
         "oa_local_auth_status",
@@ -313,15 +331,256 @@ def _canonical_base_url(base_url: str) -> str:
     return urllib.parse.urlunsplit((scheme, host, normalized_path, "", ""))
 
 
-def _ok(data: Any) -> Dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}]}
+def _version_check_recommendation() -> Dict[str, Any]:
+    return {
+        "recommended": True,
+        "tool": "oa_version_status",
+        "arguments": {},
+        "message": "本次操作完成后检查一次 OA 助手版本。检查结果会在本机缓存；只有发现新版本时才提示用户。",
+    }
 
 
-def _mcp_error(data: Any) -> Dict[str, Any]:
+def _with_version_check(data: Any, include_version_check: bool) -> Any:
+    if (
+        not include_version_check
+        or _env_flag("OA_AGENT_DISABLE_UPDATE_CHECK")
+        or not isinstance(data, dict)
+        or "versionCheck" in data
+    ):
+        return data
+    payload = dict(data)
+    payload["versionCheck"] = _version_check_recommendation()
+    return payload
+
+
+def _ok(data: Any, *, include_version_check: bool = True) -> Dict[str, Any]:
+    payload = _with_version_check(data, include_version_check)
+    return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}]}
+
+
+def _mcp_error(data: Any, *, include_version_check: bool = True) -> Dict[str, Any]:
+    payload = _with_version_check(data, include_version_check)
     return {
         "isError": True,
-        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}],
+        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
     }
+
+
+def _read_version_check_cache() -> Dict[str, Any]:
+    path = _version_check_cache_path()
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_version_check_cache(data: Dict[str, Any]) -> None:
+    _atomic_write_private_json(_version_check_cache_path(), data)
+
+
+def _acquire_version_check_lock() -> Optional[str]:
+    path = _version_check_lock_path()
+    _ensure_private_dir(path.parent)
+    token = secrets.token_urlsafe(16)
+    deadline = time.monotonic() + VERSION_CHECK_LOCK_WAIT_SECONDS
+
+    while True:
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime > VERSION_CHECK_LOCK_STALE_SECONDS:
+                    path.unlink()
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+            continue
+        except OSError:
+            return None
+
+        try:
+            os.write(fd, token.encode("ascii"))
+        except OSError:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        finally:
+            os.close(fd)
+        return token
+
+
+def _release_version_check_lock(token: Optional[str]) -> None:
+    if not token:
+        return
+    path = _version_check_lock_path()
+    try:
+        if path.read_text(encoding="ascii") == token:
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _release_version_tuple(version: str) -> Optional[tuple[int, int, int]]:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", str(version or "").strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _latest_version_from_pyproject(text: str) -> str:
+    if not re.search(r'(?m)^name\s*=\s*["\']oa-agent-connector["\']\s*$', text):
+        raise ValueError("unexpected project metadata")
+    match = re.search(r'(?m)^version\s*=\s*["\'](\d+\.\d+\.\d+)["\']\s*$', text)
+    if not match:
+        raise ValueError("version not found")
+    return match.group(1)
+
+
+def _fetch_latest_version() -> str:
+    request = urllib.request.Request(
+        VERSION_CHECK_SOURCE_URL,
+        headers={"User-Agent": f"{SERVER_NAME}/{SERVER_VERSION}"},
+    )
+    with urllib.request.urlopen(request, timeout=3) as response:
+        raw = response.read(VERSION_CHECK_MAX_BYTES + 1)
+    if len(raw) > VERSION_CHECK_MAX_BYTES:
+        raise ValueError("version metadata is too large")
+    return _latest_version_from_pyproject(raw.decode("utf-8"))
+
+
+def _version_status_payload(
+    latest_version: Optional[str],
+    *,
+    checked_at: Optional[int],
+    cached: bool,
+    status_override: str = "",
+) -> Dict[str, Any]:
+    installed = _release_version_tuple(SERVER_VERSION)
+    latest = _release_version_tuple(latest_version or "")
+    status = status_override
+    update_available: Optional[bool] = None
+    message = "暂时无法检查 OA 助手更新，不影响当前 OA 使用。"
+    agent_action: Dict[str, Any] = {
+        "notifyUser": False,
+        "requiresUserConfirmation": False,
+    }
+
+    if not status and installed and latest:
+        if latest > installed:
+            status = "update_available"
+            update_available = True
+            message = f"发现 OA 助手新版本 {latest_version}，当前版本为 {SERVER_VERSION}。"
+            agent_action = {
+                "notifyUser": True,
+                "requiresUserConfirmation": True,
+                "prompt": f"OA 助手有新版本 {latest_version}，当前版本是 {SERVER_VERSION}。是否现在升级？",
+                "upgradeRequest": f"请升级 OA 助手连接器：{VERSION_CHECK_REPOSITORY_URL}",
+                "restartRequired": True,
+            }
+        elif latest == installed:
+            status = "current"
+            update_available = False
+            message = "当前 OA 助手已是最新版。"
+        else:
+            status = "ahead"
+            update_available = False
+            message = "当前安装版本比公开版本更新，无需降级。"
+    elif status == "disabled":
+        message = "OA 助手版本检查已由本机配置关闭，不影响当前 OA 使用。"
+
+    return {
+        "ok": True,
+        "installedVersion": SERVER_VERSION,
+        "latestVersion": latest_version,
+        "status": status or "unknown",
+        "updateAvailable": update_available,
+        "checkedAt": checked_at,
+        "cached": cached,
+        "message": message,
+        "agentAction": agent_action,
+        "privacy": "只访问公开 GitHub 版本文件，不发送 OA 地址、账号、Cookie 或业务数据。",
+    }
+
+
+def _cached_version_status(now: int) -> Optional[Dict[str, Any]]:
+    cached_value = _read_version_check_cache()
+    cached_status = str(cached_value.get("status") or "")
+    if cached_status not in {"success", "failure"}:
+        return None
+    try:
+        checked_at = int(cached_value.get("checkedAt") or 0)
+    except (TypeError, ValueError):
+        return None
+    cache_ttl = (
+        VERSION_CHECK_SUCCESS_TTL_SECONDS
+        if cached_status == "success"
+        else VERSION_CHECK_FAILURE_TTL_SECONDS
+    )
+    if not checked_at or checked_at + cache_ttl <= now:
+        return None
+    latest_version = str(cached_value.get("latestVersion") or "") or None
+    if cached_status == "success" and _release_version_tuple(latest_version or "") is None:
+        return None
+    return _version_status_payload(
+        latest_version,
+        checked_at=checked_at,
+        cached=True,
+    )
+
+
+def _version_status(force: bool = False) -> Dict[str, Any]:
+    if _env_flag("OA_AGENT_DISABLE_UPDATE_CHECK"):
+        return _version_status_payload(None, checked_at=None, cached=False, status_override="disabled")
+
+    now = int(time.time())
+    if not force:
+        cached = _cached_version_status(now)
+        if cached is not None:
+            return cached
+
+    lock_token = _acquire_version_check_lock()
+    if lock_token is None:
+        cached = _cached_version_status(int(time.time()))
+        if cached is not None:
+            return cached
+        return _version_status_payload(None, checked_at=now, cached=False)
+
+    try:
+        if not force:
+            cached = _cached_version_status(int(time.time()))
+            if cached is not None:
+                return cached
+        latest_version = _fetch_latest_version()
+    except (OSError, UnicodeError, ValueError, http.client.HTTPException):
+        try:
+            _write_version_check_cache({"status": "failure", "checkedAt": now})
+        except OSError:
+            pass
+        return _version_status_payload(None, checked_at=now, cached=False)
+    else:
+        try:
+            _write_version_check_cache(
+                {
+                    "status": "success",
+                    "checkedAt": now,
+                    "latestVersion": latest_version,
+                }
+            )
+        except OSError:
+            pass
+        return _version_status_payload(latest_version, checked_at=now, cached=False)
+    finally:
+        _release_version_check_lock(lock_token)
 
 
 def _auth_required_reason(reason: str) -> bool:
@@ -457,7 +716,12 @@ def _redact_tool_message(message: str) -> str:
     return sanitize_error_message(message)
 
 
-def _tool_error(message: str, session: str = "default") -> Dict[str, Any]:
+def _tool_error(
+    message: str,
+    session: str = "default",
+    *,
+    include_version_check: bool = True,
+) -> Dict[str, Any]:
     public_message = _redact_tool_message(message)
     if _native_oa_required_reason(message):
         return _mcp_error(
@@ -466,9 +730,13 @@ def _tool_error(message: str, session: str = "default") -> Dict[str, Any]:
                 "reason": public_message,
                 "approvalHandling": _approval_handling("native_oa_required"),
                 "nextStep": "请使用详情链接打开 OA 原生页面完成这条审批。",
-            }
+            },
+            include_version_check=include_version_check,
         )
-    return _mcp_error(_setup_guide(public_message, session=session))
+    return _mcp_error(
+        _setup_guide(public_message, session=session),
+        include_version_check=include_version_check,
+    )
 
 
 def _plain_text(value: Any) -> str:
@@ -1124,6 +1392,13 @@ PASSWORD_LOGIN_TOOL = _tool_schema(
 
 TOOLS = [
     _tool_schema(
+        "oa_version_status",
+        "检查 OA 助手是否有新版本。每次业务操作后调用一次即可，结果会在本机缓存；只有发现新版本时才提示用户，并且升级前必须先征得用户确认。",
+        {
+            "force": {"type": "boolean", "description": "忽略本机缓存并立即检查，默认 false；普通使用不要开启"},
+        },
+    ),
+    _tool_schema(
         "oa_setup_guide",
         "当用户想查看 OA 待办但 MCP 未配置、未授权或授权过期时，返回分步配置和授权指引。",
         {
@@ -1452,6 +1727,16 @@ def _http_transport_confirmation_error(session: str, base_url: str, expires_in: 
 
 def call_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     _cleanup_expired_batch_terminal_results()
+
+    if name == "oa_version_status":
+        unknown = set(args) - {"force"}
+        if unknown:
+            raise OAConnectorError(f"版本检查不接受参数: {', '.join(sorted(unknown))}")
+        return _ok(
+            _version_status(force=_bool(args, "force")),
+            include_version_check=False,
+        )
+
     session = _session(args)
     insecure = _bool(args, "insecure")
 
@@ -2179,9 +2464,17 @@ def handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                     except Exception as retry_exc:
                         if _auth_required_reason(str(retry_exc)):
                             _block_auto_login(session)
-                        result = _tool_error(str(retry_exc), session=session)
+                        result = _tool_error(
+                            str(retry_exc),
+                            session=session,
+                            include_version_check=tool_name != "oa_version_status",
+                        )
                 else:
-                    result = _tool_error(str(exc), session=session)
+                    result = _tool_error(
+                        str(exc),
+                        session=session,
+                        include_version_check=tool_name != "oa_version_status",
+                    )
             return _response(message_id, result)
         return _response(message_id, error={"code": -32601, "message": f"Method not found: {method}"})
     except Exception as exc:
